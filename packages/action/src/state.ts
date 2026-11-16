@@ -19,6 +19,8 @@ const FindingSchema = type({
   /** Exact lines that prove the finding, as `file:line` with the code. */
   evidence: "string[]",
   "rule?": "string",
+  /** Set on findings from the UI lens; code findings carry none, so older state reads as code. */
+  "lens?": "'ui'",
 });
 
 const TrackedSchema = FindingSchema.and({
@@ -35,6 +37,8 @@ const TrackedSchema = FindingSchema.and({
 const StateSchema = type({
   head: "string",
   score: "1 | 2 | 3 | 4 | 5",
+  /** The UI lens's score, when the repo configures `ui`. `score` covers code findings only. */
+  "uiScore?": "1 | 2 | 3 | 4 | 5",
   findings: TrackedSchema.array(),
   "files?": "Record<string, string>",
 });
@@ -54,6 +58,15 @@ export function score(findings: readonly Pick<Finding, "severity">[]): Score {
   if (critical === 1) return 2;
   if (findings.some((f) => f.severity === "major")) return 3;
   return findings.length > 0 ? 4 : 5;
+}
+
+/**
+ * The state as one lens sees it: its findings and its score. Render and the check work on a
+ * State, so each lens gets its own summary lines and check without a second code path.
+ */
+export function lensView(state: State, lens: "code" | "ui"): State {
+  const findings = state.findings.filter((f) => (f.lens === "ui") === (lens === "ui"));
+  return { ...state, findings, score: lens === "ui" ? (state.uiScore ?? 5) : state.score };
 }
 
 /** Stable id for a finding: same file and title is the same finding across runs. */

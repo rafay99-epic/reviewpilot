@@ -2,7 +2,7 @@
 
 import type { Annotation, CheckUpdate } from "./github.ts";
 import type { Finding, Score, State, Tracked } from "./state.ts";
-import { findingTag, SEVERITIES, SUMMARY_TAG, writeState } from "./state.ts";
+import { findingTag, lensView, SEVERITIES, SUMMARY_TAG, writeState } from "./state.ts";
 
 const ORDER = { critical: 0, major: 1, minor: 2 } as const;
 export const bySeverity = <T extends Pick<Finding, "severity">>(a: T, b: T) => ORDER[a.severity] - ORDER[b.severity];
@@ -23,7 +23,7 @@ const linkText = (text: string) => flat(text).replace(/[[\]()]/g, "");
 const fence = (lines: readonly string[]) => `\`\`\`text\n${lines.join("\n").replaceAll("```", "'''")}\n\`\`\``;
 
 export function inlineBody(f: Tracked): string {
-  const tag = f.rule ? ` · rule \`${linkText(f.rule)}\`` : "";
+  const tag = `${f.lens === "ui" ? " · UI" : ""}${f.rule ? ` · rule \`${linkText(f.rule)}\`` : ""}`;
   return [
     `**${flat(f.title)}** · ${f.severity}${tag}`,
     "",
@@ -116,14 +116,16 @@ export function checkResult(state: State, run: Run, summaryUrl: string, partial:
   };
 }
 
-export function summaryBody(state: State, prev: State | undefined, outside: readonly Tracked[], run: Run, pass: Score = 5): string {
+/** The summary comment. `uiPass` is set when the repo runs the UI lens: its score and blockers show beside the code ones. */
+export function summaryBody(state: State, prev: State | undefined, outside: readonly Tracked[], run: Run, pass: Score = 5, uiPass?: Score): string {
   const open = state.findings.filter((f) => f.status === "open").sort(bySeverity);
   const fixed = state.findings.filter((f) => f.status === "fixed" && prev?.findings.some((p) => p.fp === f.fp && p.status === "open"));
   const fresh = open.filter((f) => !prev?.findings.some((p) => p.fp === f.fp && p.status === "open"));
   const link = (f: Finding) =>
     `[${linkText(f.file.split("/").pop() ?? f.file)}:${f.line}](https://github.com/${run.repo}/blob/${run.head}/${f.file.split("/").map(encodeURIComponent).join("/")}#L${f.line})`;
 
-  const lines = [`## ReviewPilot: ${state.score}/5`];
+  const ui = uiPass !== undefined ? lensView(state, "ui") : undefined;
+  const lines = [`## ReviewPilot: ${state.score}/5${ui ? ` · UI ${ui.score}/5` : ""}`];
   if (prev && prev.head !== state.head) {
     const move: string = prev.score === state.score ? `${state.score}/5` : `${prev.score}/5 → ${state.score}/5`;
     lines.push(`<sub>Since ${prev.head.slice(0, 7)}: ${move} · ${fixed.length} fixed · ${fresh.length} new · ${open.length} open</sub>`);
@@ -131,9 +133,13 @@ export function summaryBody(state: State, prev: State | undefined, outside: read
   lines.push("");
 
   if (open.length) {
-    lines.push(blockers(state, pass), "");
+    const code = blockers(lensView(state, "code"), pass);
+    const design = ui && blockers(ui, uiPass);
+    lines.push(...(code ? [code] : []), ...(design ? [`UI: ${design}`] : []), "");
     lines.push("| Severity | Finding | Where |", "| --- | --- | --- |");
-    for (const f of open.filter((o) => !outside.includes(o))) lines.push(`| ${f.severity} | ${flat(f.title).replaceAll("|", "\\|")} | ${link(f)} |`);
+    for (const f of open.filter((o) => !outside.includes(o))) {
+      lines.push(`| ${f.severity}${f.lens === "ui" ? " · UI" : ""} | ${flat(f.title).replaceAll("|", "\\|")} | ${link(f)} |`);
+    }
   } else {
     lines.push("No verified issues.");
   }

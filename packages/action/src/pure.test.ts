@@ -4,7 +4,8 @@ import { DEFAULTS, ignored, loadConfig, rulesFor } from "./config.ts";
 import { anchor, type FileDiff, parseDiff, unquote } from "./diff.ts";
 import { blockers, checkResult, clean, summaryBody } from "./render.ts";
 import { answerReply, chunk, focus, inFile, type Limits, newFindingRank, nextFiles, ranges, reportable, settle, stale, submitFindings } from "./review.ts";
-import { diffHash, findingTag, fingerprint, postedOnHead, readState, score, STATE_BUDGET, writeState } from "./state.ts";
+import { exportsOf, fit } from "./catalog.ts";
+import { diffHash, findingTag, fingerprint, lensView, postedOnHead, readState, score, STATE_BUDGET, writeState } from "./state.ts";
 
 const DIFF = `diff --git a/src/a.ts b/src/a.ts
 index 1..2 100644
@@ -273,7 +274,7 @@ test("a reply closes its finding with an answer that says what the re-check foun
 });
 
 test("an agent out of budget still records the files it lists; before that, it must cover them all", () => {
-  const submit = submitFindings(["a.ts", "b.ts"]);
+  const submit = submitFindings(["a.ts", "b.ts"], "code");
   const args = { checked_files: ["./a.ts"], findings: [] };
   assert.equal(submit.parse(args, false).ok, false);
   const forced = submit.parse(args, true);
@@ -335,4 +336,37 @@ test("the check passes only at 5/5 and annotates each open finding", () => {
   const unfinished = checkResult({ head: "h", score: 5, findings: [] }, run, "u", "incomplete");
   assert.equal(unfinished.conclusion, "failure");
   assert.match(unfinished.output?.summary ?? "", /did not finish/);
+});
+
+test("the UI catalog lists a file's exported components, re-exports and CSS tokens", () => {
+  const src = `export function Button() {}\nexport const Card = () => null;\nexport type ButtonProps = {};\nexport { Sheet as BottomSheet, Row };\nexport default Button;\nconst local = 1;`;
+  assert.deepEqual(exportsOf(src), ["Button", "Card", "ButtonProps", "BottomSheet", "Row"]);
+  assert.deepEqual(exportsOf(":root {\n  --space-2: 8px;\n  --brand: #000;\n}"), ["--space-2", "--brand"]);
+});
+
+test("ui config is off by default, fills its lists, and needs at least one path", () => {
+  assert.equal(loadConfig(undefined).config.ui, undefined);
+  assert.deepEqual(loadConfig("ui:\n  paths: [\"src/**/*.tsx\"]\n  docs: [UI.md]\n").config.ui, {
+    paths: ["src/**/*.tsx"], components: [], tokens: [], docs: ["UI.md"], pass_score: 5,
+  });
+  assert.match(loadConfig("ui:\n  paths: []\n").warning ?? "", /paths/);
+});
+
+test("code and UI findings score apart and show side by side in the summary", () => {
+  const run = { repo: "o/r", head: "abcdef0", model: "m", files: 1, reviewed: 1, candidates: 1, verified: 1, seconds: 5, timing: "", tokens: { prompt: 1, cached: 0 } };
+  const f = { file: "a.tsx", line: 3, endLine: 3, severity: "minor" as const, title: "Hand-built button", body: "b", evidence: [], fp: "fp1", status: "open" as const, lens: "ui" as const };
+  const state = { head: "abcdef0", score: 5 as const, uiScore: 4 as const, findings: [f] };
+  assert.deepEqual(lensView(state, "code").findings, []);
+  assert.equal(lensView(state, "ui").score, 4);
+  assert.equal(checkResult(lensView(state, "code"), run, "u", false).conclusion, "success");
+  assert.equal(checkResult(lensView(state, "ui"), run, "u", false).conclusion, "failure");
+  const body = summaryBody(state, undefined, [], run, 5, 5);
+  assert.match(body, /## ReviewPilot: 5\/5 · UI 4\/5/);
+  assert.match(body, /UI: \*\*Not 5\/5 because of:\*\* 1 minor/);
+  assert.match(body, /\| minor · UI \| Hand-built button \|/);
+});
+
+test("catalog sections keep whole lines within their budget and say what was left out", () => {
+  assert.equal(fit(["- a", "- b"], 100), "- a\n- b");
+  assert.equal(fit(["- aaaa", "- bbbb", "- cccc"], 14), "- aaaa\n- bbbb\n(1 more files not listed; search the repository for them)");
 });

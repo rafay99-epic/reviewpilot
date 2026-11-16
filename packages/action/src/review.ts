@@ -2,6 +2,7 @@
 // needs and lists candidate defects. Verify: a fresh agent per candidate tries to disprove it
 // against the code, and only what survives is posted.
 
+import { matchesGlob } from "node:path";
 import { type } from "arktype";
 import type { Submit } from "./agent.ts";
 import { runAgent } from "./agent.ts";
@@ -52,7 +53,7 @@ function toolSpec(name: string, description: string, schema: type.Any): ToolSpec
 /** A find agent's answer: its candidates, and the files it says it checked. */
 type FindResult = { findings: Finding[]; checked: Set<string> };
 
-export function submitFindings(changed: readonly string[]): Submit<FindResult> {
+export function submitFindings(changed: readonly string[], lens: "code" | "ui"): Submit<FindResult> {
   return {
     spec: toolSpec("submit_findings", "Submit the review. Call once, after checking every changed file.", Findings),
     parse(args, final) {
@@ -78,6 +79,7 @@ export function submitFindings(changed: readonly string[]): Submit<FindResult> {
           body: c.body.trim(),
           evidence: c.evidence,
           ...(c.rule ? { rule: c.rule } : {}),
+          ...(lens === "ui" ? { lens } : {}),
           })),
         },
       };
@@ -135,6 +137,32 @@ Confirm only if every step holds. Reject if any step fails or you cannot finish 
 Exception: for a finding reported on an earlier commit, the only question is whether the problem is still in the code. A rejection marks it fixed, so reject only when you can show the current code no longer has it; if you cannot finish the check, confirm it.
 
 Call submit_verdict with the verdict, a one or two sentence reason, the evidence lines you checked ("path:line: code"), and the severity you would give it. When confirming, also give a corrected title and body if the original overstates or misdescribes the problem.`;
+
+const UI_SYSTEM = `You are ReviewPilot's UI reviewer. You check that a pull request's UI code stays consistent with this repository's own design system. Bugs and logic are another reviewer's job; ignore them.
+
+You are the first of two passes: a verifier checks each candidate against the code and throws out anything it cannot prove, so list every specific suspicion, but only ones you can point to.
+
+You get the catalog of the repository's shared components and design tokens, its UI docs if any, and part of the diff. You can read any file, search the repository and list directories. Search for how existing screens do the same thing before you call something inconsistent.
+
+Look for:
+- a new component that duplicates one in the catalog (same job, maybe a different name or file)
+- raw primitives or markup where a shared component exists (a hand-built button, card, sheet, list row, text style)
+- hard-coded colors, spacing, radii, font sizes or shadows where a token exists
+- a screen or layout that skips the shared layout wrapper, header, spacing or structure its sibling screens use
+- a variant built by copying and editing a component instead of using its props
+- anything the UI docs forbid or require
+
+Report only on lines this PR changes. Do not report: taste, naming, copy, formatting, accessibility or bugs (other reviewers own those), or code that matches what the rest of the app already does, even if the docs say otherwise.
+
+Severity:
+- major: a duplicate of a shared component, or a pattern that will spread (a new hand-rolled primitive other screens will copy)
+- minor: a one-off hard-coded value or local deviation where a token or shared component exists
+
+Finish by calling submit_findings once, as described in its schema. In evidence, cite both the changed line and the shared component or token it should use ("path:line: code").`;
+
+const VERIFY_UI = `
+
+This is a UI consistency finding. Also check: the shared component or token it names exists at the PR head and is exported; it actually covers this case (its props support the variant, the token means this value); and the rest of the app uses it for the same thing. Reject when the shared one cannot do what the new code needs, or when the codebase itself is split on the pattern.`;
 
 function repoSection(config: Config, rules: readonly Rule[], guidance: string): string {
   const parts: string[] = [];
@@ -349,6 +377,8 @@ export type ReviewInput = {
   followUp: boolean;
   /** Files whose diff moved since the last review: their earlier findings are checked again. */
   changed: ReadonlySet<string>;
+  /** The design-system catalog (see uiCatalog) when the repo configures `ui`; the UI lens runs only then. */
+  ui?: { paths: readonly string[]; catalog: string };
   /** Open findings the PR author or a maintainer replied to, by fingerprint, with the reply: always checked again. */
   replies: ReadonlyMap<string, string>;
   log: (line: string) => void;
@@ -374,16 +404,23 @@ export async function review(
   ].filter(Boolean);
 
   const all = diffs.map((d) => `- ${d.path} (${d.status})`).join("\n");
-  const chunks = chunk(input.scope, CHUNK_CHARS);
-  log(`find: ${changed.length} of ${diffs.length} files in ${chunks.length} parts`);
+  // Code parts first, then UI parts over the UI files. Only code parts decide coverage.
+  const ui = input.ui;
+  const uiScope = ui ? input.scope.filter((d) => ui.paths.some((g) => matchesGlob(d.path, g))) : [];
+  const codeChunks = chunk(input.scope, CHUNK_CHARS);
+  const chunks = [...codeChunks, ...chunk(uiScope, CHUNK_CHARS)];
+  const lensOf = (i: number): "code" | "ui" => (i < codeChunks.length ? "code" : "ui");
+  log(`find: ${changed.length} of ${diffs.length} files in ${codeChunks.length} parts${ui ? `, ${uiScope.length} UI files in ${chunks.length - codeChunks.length} parts` : ""}`);
 
   const findStart = Date.now();
   const parts = await pool(chunks, FIND_AGENTS, async (part, i) => {
+    const lens = lensOf(i);
     const mine = part.filter((d) => d.status !== "deleted").map((d) => d.path);
     const user = [
       `PR title: ${input.pr.title}`,
       `PR description:\n${input.pr.body.slice(0, 4000) || "(none)"}`,
       ...history,
+      ...(lens === "ui" && ui ? [ui.catalog ? `Design system catalog (default branch):\n${ui.catalog}` : "No shared components or tokens are configured; compare against how the rest of the app does it."] : []),
       `All files changed in the PR:\n${all}`,
       `Your part (${i + 1} of ${chunks.length}). Diff, left column is the line number at the PR head; + added, - removed:\n\n${part
         .map((d) => {
@@ -398,14 +435,14 @@ export async function review(
     return runAgent({
       llm: input.find,
       root: input.root,
-      system: FIND_SYSTEM + repoSection(config, input.rules, input.guidance),
+      system: (lens === "ui" ? UI_SYSTEM : FIND_SYSTEM) + repoSection(config, input.rules, input.guidance),
       user,
-      submit: submitFindings(mine),
+      submit: submitFindings(mine, lens),
       maxTurns: 12,
       deadline: Date.now() + FIND_MS,
-      log: (line) => log(`[part ${i + 1}] ${line}`),
+      log: (line) => log(`[${lens === "ui" ? "ui " : ""}part ${i + 1}] ${line}`),
     }).catch((e: unknown) => {
-      log(`[part ${i + 1}] find failed: ${e instanceof Error ? e.message : String(e)}`);
+      log(`[${lens === "ui" ? "ui " : ""}part ${i + 1}] find failed: ${e instanceof Error ? e.message : String(e)}`);
       return undefined;
     });
   });
@@ -413,7 +450,7 @@ export async function review(
   const failedParts = parts.filter((p) => p === undefined).length;
   // Files the agents checked. A failed part's files, and any a part ran out of budget on,
   // are read again on the next run.
-  const reviewed = chunks.flatMap((part, i) => {
+  const reviewed = codeChunks.flatMap((part, i) => {
     const p = parts[i];
     return p ? part.filter((d) => p.checked.has(d.path)).map((d) => d.path) : [];
   });
@@ -456,7 +493,7 @@ export async function review(
     const verdict = await runAgent({
       llm: input.verify,
       root: input.root,
-      system: VERIFY_SYSTEM,
+      system: VERIFY_SYSTEM + (finding.lens === "ui" ? VERIFY_UI : ""),
       user: [
         prev
           ? "This finding was reported on an earlier commit. Check whether it is still present at the current PR head (see the exception for earlier findings)."

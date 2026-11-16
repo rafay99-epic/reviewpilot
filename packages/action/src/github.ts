@@ -159,7 +159,7 @@ export function createGitHub(token: string, repo: string) {
     comment: (n: number, body: string) => call(Created, "POST", `${r}/issues/${n}/comments`, { body }),
     editComment: (id: number, body: string) => call(Created, "PATCH", `${r}/issues/comments/${id}`, { body }),
     /** The ReviewPilot check on a commit. Needs Checks write on the token. */
-    createCheck: (head: string, body: CheckUpdate) => call(Created, "POST", `${r}/check-runs`, { name: "ReviewPilot", head_sha: head, ...body }),
+    createCheck: (head: string, body: CheckUpdate, name = "ReviewPilot") => call(Created, "POST", `${r}/check-runs`, { name, head_sha: head, ...body }),
     updateCheck: (id: number, body: CheckUpdate) => call(Created, "PATCH", `${r}/check-runs/${id}`, body),
     /** ReviewPilot checks on a commit that are still in progress, with when they started. */
     runningChecks: async (head: string) =>

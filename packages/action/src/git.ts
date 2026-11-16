@@ -80,3 +80,7 @@ export async function fetchRef(root: string, branch: string): Promise<string> {
   await git(root, "fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/reviewpilot/default`);
   return "refs/reviewpilot/default";
 }
+
+/** Every file path on a ref. */
+export const filesAt = async (root: string, ref: string) =>
+  (await git(root, "-c", "core.quotePath=off", "ls-tree", "-r", "--name-only", ref)).split("\n").filter(Boolean);
