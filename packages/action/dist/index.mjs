@@ -16100,6 +16100,8 @@ var FileConfig = type({
   "review?": {
     "ignore?": "string[]",
     "min_severity?": Severity,
+    /** New findings on a push after the first review must be at least this severe, so fixes converge. */
+    "follow_up_min_severity?": Severity,
     "max_findings?": "0 < number.integer <= 50",
     /** On a push: `changed` reviews only the lines changed since the last review, `all` the whole PR. */
     "scope?": "'changed' | 'all'",
@@ -16136,6 +16138,7 @@ var DEFAULTS = {
       "**/*.lottie"
     ],
     min_severity: "minor",
+    follow_up_min_severity: "major",
     max_findings: 20,
     scope: "changed",
     outside_diff: "drop",
@@ -16981,9 +16984,10 @@ function submitFindings(changed) {
       return {
         ok: true,
         value: {
-          // A forced answer means the agent ran out of budget, so its list is not trusted:
-          // none of the part's files count as reviewed and the next push reads them again.
-          checked: final ? /* @__PURE__ */ new Set() : checked,
+          // A forced answer still counts for the files the agent lists. Discarding it made
+          // every push re-read those files whole (agents often use their full budget), which
+          // raised new findings in code already reviewed and kept the score from settling.
+          checked,
           findings: out.findings.map((c) => ({
             file: c.file.replace(/^\.\//, ""),
             line: c.line,
@@ -17121,6 +17125,17 @@ function inFile(file, limits) {
   if (limits.incremental && !limits.scope.some((d) => d.path === file)) return false;
   return limits.diffs.some((d) => d.path === file);
 }
+var newFindingRank = (config, followUp) => Math.min(
+  SEVERITIES.indexOf(config.review.min_severity),
+  followUp ? SEVERITIES.indexOf(config.review.follow_up_min_severity) : SEVERITIES.length
+);
+function answerReply(verdict, sha, inReview = true) {
+  const why = verdict ? ` ${verdict.reason.replace(/\s+/g, " ").trim().slice(0, 400)}` : "";
+  if (verdict?.verdict === "rejected") return `Checked at ${sha}: your reply holds.${why}`;
+  const unchecked = inReview ? `Could not re-check it at ${sha}.` : `Not re-checked at ${sha}: its file did not fit in this review.`;
+  const status = verdict ? `Still present at ${sha}.${why}` : unchecked;
+  return `${status} Dismissed on your reply, so it no longer counts against the score.`;
+}
 function ranges(lines) {
   const sorted = [...lines].sort((a, b) => a - b);
   const out = [];
@@ -17201,12 +17216,15 @@ ${d.numbered}`;
   const exists = await Promise.all(candidates.map((c) => inside(input2.root, c.file).then(Boolean)));
   const real = candidates.filter((_, i) => exists[i]);
   if (real.length < candidates.length) log2(`find: dropped ${candidates.length - real.length} candidates citing files not in the repo`);
-  const found = real.filter((c) => inFile(c.file, input2.limits)).map(({ rule, ...c }) => rule && ruleIds.has(rule) ? { ...c, rule } : c).sort(bySeverity);
-  if (found.length < real.length) log2(`find: dropped ${real.length - found.length} candidates in files this review does not cover`);
+  const inBounds = real.filter((c) => inFile(c.file, input2.limits));
+  if (inBounds.length < real.length) log2(`find: dropped ${real.length - inBounds.length} candidates in files this review does not cover`);
+  const rank = newFindingRank(config, input2.followUp);
+  const found = inBounds.filter((c) => SEVERITIES.indexOf(c.severity) <= rank).map(({ rule, ...c }) => rule && ruleIds.has(rule) ? { ...c, rule } : c).sort(bySeverity);
+  if (found.length < inBounds.length) log2(`find: dropped ${inBounds.length - found.length} candidates less severe than ${SEVERITIES[rank]}${input2.followUp ? " (follow-up review)" : ""}`);
   log2(`find: ${found.length} candidates${found.length > MAX_VERIFY ? `, verifying the ${MAX_VERIFY} most severe` : ""}`);
   const changedPaths = input2.changed;
   const recheck = open.filter((p) => diffs.some((d) => d.path === p.file));
-  const due = recheck.filter((p) => stale(p, changedPaths));
+  const due = recheck.filter((p) => input2.replies.has(p.fp) || stale(p, changedPaths));
   if (due.length < recheck.length) log2(`verify: ${recheck.length - due.length} earlier findings kept as they were, their code did not change`);
   const jobs = [
     ...found.slice(0, MAX_VERIFY).map((finding) => ({ finding })),
@@ -17215,12 +17233,16 @@ ${d.numbered}`;
   const patchOf = (file) => diffs.find((d) => d.path === file)?.numbered ?? "(This file is not changed in the PR. Open it with read_file, and check what in the diff it depends on.)";
   const verifyStart = Date.now();
   const checked = await pool(jobs, VERIFY_AGENTS, async ({ finding, previous: prev }) => {
+    const reply = prev && input2.replies.get(prev.fp);
     const verdict = await runAgent({
       llm: input2.verify,
       root: input2.root,
       system: VERIFY_SYSTEM,
       user: [
         prev ? "This finding was reported on an earlier commit. Check whether it is still present at the current PR head (see the exception for earlier findings)." : "",
+        reply ? `The PR author replied to it:
+> ${reply.replaceAll("\n", "\n> ")}
+Check the reply against the code; it is a claim, not evidence. Reject if the code shows it is fixed, or shows the behaviour is intended and harmless (never for security or privacy).` : "",
         `Finding:
 ${JSON.stringify(
           { file: finding.file, line: finding.line, end_line: finding.endLine, severity: finding.severity, title: finding.title, body: finding.body, evidence: finding.evidence },
@@ -17435,15 +17457,20 @@ ${text}` : "";
     );
     const minRank = SEVERITIES.indexOf(config.review.min_severity);
     const previous = (prev?.findings ?? []).map((f) => ({ ...f }));
+    const replies = /* @__PURE__ */ new Map();
     for (const p of previous.filter((f) => f.status === "open")) {
       if (!touched.has(p.file)) {
         p.status = "fixed";
         continue;
       }
       const t = threadOf(p);
-      const replied = t?.comments.slice(1).some((c) => c.author === pr.user.login || MAINTAINERS.has(c.association));
       const resolved = t?.resolved && !ours(t.resolvedBy);
-      if (resolved || replied || SEVERITIES.indexOf(p.severity) > minRank) p.status = "dismissed";
+      if (resolved || SEVERITIES.indexOf(p.severity) > minRank) {
+        p.status = "dismissed";
+        continue;
+      }
+      const reply = t?.comments.slice(1).findLast((c) => !ours(c.author) && (c.author === pr.user.login || MAINTAINERS.has(c.association)));
+      if (reply) replies.set(p.fp, reply.body.slice(0, 1500));
     }
     const llm = (m) => createLlm({ baseUrl, apiKey, model: m, effort: config.model.effort });
     const find = llm(model);
@@ -17455,6 +17482,7 @@ ${text}` : "";
     }) : void 0;
     const { scope: scope2, fresh: freshLines, changed } = focus(diffs, seen, since);
     const limits = { diffs, scope: scope2, fresh: freshLines, incremental: seen !== void 0, outside: config.review.outside_diff };
+    const followUp = !comment && prev !== void 0;
     const { checked, candidates, verified, failedParts, parts, reviewed, findMs, verifyMs } = await log.phase(
       "Review",
       () => review({
@@ -17469,20 +17497,29 @@ ${text}` : "";
         scope: scope2,
         previous,
         limits,
+        followUp,
         changed,
+        replies,
         log: log.line
       })
     );
+    const acks = /* @__PURE__ */ new Map();
+    const sha = pr.head.sha.slice(0, 7);
     const { findings, fresh, notes, overCap } = await log.phase("Merge", async () => {
       const findings2 = previous.map((p) => {
         if (p.status !== "open") return p;
         const c = checked.find((x) => x.previous === p);
+        if (replies.has(p.fp)) {
+          acks.set(p.fp, answerReply(c?.verdict, sha, diffs.some((d) => d.path === p.file)));
+          return { ...p, status: "dismissed" };
+        }
         if (!c?.verdict) return p;
         if (c.verdict.verdict !== "confirmed") return { ...p, status: "fixed" };
         const { line, endLine, severity } = settle(p, c.verdict);
         return { ...p, line, endLine, severity };
       });
-      const confirmed = checked.flatMap((c) => !c.previous && c.verdict?.verdict === "confirmed" ? [settle(c.finding, c.verdict)] : []).filter((f) => SEVERITIES.indexOf(f.severity) <= minRank && reportable(f, limits)).sort(bySeverity);
+      const newRank = newFindingRank(config, followUp);
+      const confirmed = checked.flatMap((c) => !c.previous && c.verdict?.verdict === "confirmed" ? [settle(c.finding, c.verdict)] : []).filter((f) => SEVERITIES.indexOf(f.severity) <= newRank && reportable(f, limits)).sort(bySeverity);
       const known = findings2.filter((t) => t.status !== "fixed");
       const fresh2 = [];
       const notes2 = [];
@@ -17531,6 +17568,7 @@ ${text}` : "";
     }
     const wasOpen = new Set(prev?.findings.filter((p) => p.status === "open").map((p) => p.fp));
     const fixedNow = findings.filter((f) => f.status === "fixed" && wasOpen.has(f.fp));
+    const closing = findings.filter((f) => wasOpen.has(f.fp) && (f.status === "fixed" || acks.has(f.fp)));
     const warningText = [
       warning,
       skipped > 0 ? `${skipped} files did not fit in the review budget and were not reviewed.` : "",
@@ -17594,9 +17632,9 @@ ${summaryBody(state, prev, outside, run2, config.review.pass_score)}`);
         if (old.id !== summaryId) await gh.retire(old).catch((e) => log.warn(`Could not retire summary ${old.id}: ${String(e)}`));
       }
       let unresolved = 0;
-      await pool(fixedNow, 2, async (f) => {
+      await pool(closing, 2, async (f) => {
         if (f.commentId !== void 0) {
-          await gh.reply(number2, f.commentId, `Fixed in ${pr.head.sha.slice(0, 7)}.`).catch((e) => log.warn(`Reply on ${f.fp} failed: ${String(e)}`));
+          await gh.reply(number2, f.commentId, clean(acks.get(f.fp) ?? `Fixed in ${sha}.`)).catch((e) => log.warn(`Reply on ${f.fp} failed: ${String(e)}`));
         }
         const t = threadOf(f);
         if (!t || t.resolved) return;
@@ -17607,7 +17645,8 @@ ${summaryBody(state, prev, outside, run2, config.review.pass_score)}`);
         if (!resolved) unresolved += 1;
       });
       if (unresolved) log.line(`${unresolved} fixed threads collapsed but left unresolved: resolving needs Contents write on the token.`);
-      const partial = failedParts > 0 || checked.some((c) => !c.verdict) ? "incomplete" : skipped > 0 ? "skipped" : false;
+      const unsettled = checked.some((c) => !c.verdict && !(c.previous && replies.has(c.previous.fp)));
+      const partial = failedParts > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
       const result = checkResult(state, run2, `https://github.com/${repo}/pull/${number2}#issuecomment-${summaryId}`, partial, config.review.pass_score);
       const finished = checkId !== void 0 && await gh.updateCheck(checkId, { status: "completed", completed_at: (/* @__PURE__ */ new Date()).toISOString(), ...result }).then(() => true, () => false);
       if (checkId !== void 0 && !finished && result.output) await finishCheck({ ...result, output: { ...result.output, annotations: [] } });

@@ -24,6 +24,8 @@ const FileConfig = type({
   "review?": {
     "ignore?": "string[]",
     "min_severity?": Severity,
+    /** New findings on a push after the first review must be at least this severe, so fixes converge. */
+    "follow_up_min_severity?": Severity,
     "max_findings?": "0 < number.integer <= 50",
     /** On a push: `changed` reviews only the lines changed since the last review, `all` the whole PR. */
     "scope?": "'changed' | 'all'",
@@ -51,6 +53,7 @@ export const DEFAULTS = {
       "**/*.png", "**/*.jpg", "**/*.svg", "**/*.ico", "**/*.lottie",
     ],
     min_severity: "minor",
+    follow_up_min_severity: "major",
     max_findings: 20,
     scope: "changed",
     outside_diff: "drop",
@@ -66,6 +69,7 @@ export type Config = {
   review: {
     ignore: string[];
     min_severity: (typeof SEVERITIES)[number];
+    follow_up_min_severity: (typeof SEVERITIES)[number];
     max_findings: number;
     scope: "changed" | "all";
     outside_diff: "drop" | "summary";
