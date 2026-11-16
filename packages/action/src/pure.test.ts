@@ -269,6 +269,7 @@ test("a reply closes its finding with an answer that says what the re-check foun
   assert.equal(answerReply(verdict("rejected"), "abc1234"), "Checked at abc1234: your reply holds. Line 4 guards it.");
   assert.match(answerReply(verdict("confirmed"), "abc1234"), /^Still present at abc1234\. Line 4 guards it\. Dismissed on your reply/);
   assert.match(answerReply(undefined, "abc1234"), /^Could not re-check it at abc1234\. Dismissed/);
+  assert.match(answerReply(undefined, "abc1234", false), /^Not re-checked at abc1234: its file did not fit in this review\. Dismissed/);
 });
 
 test("an agent out of budget still records the files it lists; before that, it must cover them all", () => {

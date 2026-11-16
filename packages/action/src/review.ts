@@ -275,13 +275,16 @@ export const newFindingRank = (config: Config, followUp: boolean): number =>
 
 /**
  * ReviewPilot's answer on the thread of an open finding the PR author or a maintainer replied
- * to, given its re-check (undefined when the check failed). The finding is always closed as
- * dismissed: a rejection can mean fixed or intended, and only dismissed is never raised again.
+ * to, given its re-check: undefined when the check failed, or when it was never run because
+ * the finding's file did not fit in the review (`inReview` false). The finding is always
+ * closed as dismissed: a rejection can mean fixed or intended, and only dismissed is never
+ * raised again.
  */
-export function answerReply(verdict: VerdictResult | undefined, sha: string): string {
+export function answerReply(verdict: VerdictResult | undefined, sha: string, inReview = true): string {
   const why = verdict ? ` ${verdict.reason.replace(/\s+/g, " ").trim().slice(0, 400)}` : "";
   if (verdict?.verdict === "rejected") return `Checked at ${sha}: your reply holds.${why}`;
-  const status = verdict ? `Still present at ${sha}.${why}` : `Could not re-check it at ${sha}.`;
+  const unchecked = inReview ? `Could not re-check it at ${sha}.` : `Not re-checked at ${sha}: its file did not fit in this review.`;
+  const status = verdict ? `Still present at ${sha}.${why}` : unchecked;
   return `${status} Dismissed on your reply, so it no longer counts against the score.`;
 }
 

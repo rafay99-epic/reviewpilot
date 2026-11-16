@@ -53,7 +53,7 @@ On every push, open findings are checked again against the new code:
 
 - **Fixed.** ReviewPilot replies "Fixed in" with the commit and collapses the comment as outdated. It also resolves the thread when its token has Contents write; GitHub requires that for an App to resolve threads.
 - **Still open.** It stays in the table with its original wording. A finding whose file and cited code did not change since the last review keeps its verdict without being verified again.
-- **Replied to.** When the PR author or a maintainer replied, the finding is checked again with the reply as context, whatever changed. ReviewPilot answers on the thread with what it found ("Checked at …: your reply holds", or "Still present at …, dismissed on your reply") and closes it as dismissed.
+- **Replied to.** When the PR author or a maintainer replied, the finding is checked again with the reply as context, whatever changed (as long as its file fits in the review; otherwise the answer says it was not re-checked). ReviewPilot answers on the thread with what it found ("Checked at …: your reply holds", or "Still present at …, dismissed on your reply") and closes it as dismissed.
 - **New.** Posted inline, counted in the delta line. After the first review, only major and critical findings are raised (`review.follow_up_min_severity`); a minor nit in a fix does not hold the score at 4/5.
 
 A finding is dismissed, and never raised again, when someone other than ReviewPilot resolves its thread, or when the PR author or a maintainer replies to it (after the re-check above).

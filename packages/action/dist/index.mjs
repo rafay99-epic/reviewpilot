@@ -17129,10 +17129,11 @@ var newFindingRank = (config, followUp) => Math.min(
   SEVERITIES.indexOf(config.review.min_severity),
   followUp ? SEVERITIES.indexOf(config.review.follow_up_min_severity) : SEVERITIES.length
 );
-function answerReply(verdict, sha) {
+function answerReply(verdict, sha, inReview = true) {
   const why = verdict ? ` ${verdict.reason.replace(/\s+/g, " ").trim().slice(0, 400)}` : "";
   if (verdict?.verdict === "rejected") return `Checked at ${sha}: your reply holds.${why}`;
-  const status = verdict ? `Still present at ${sha}.${why}` : `Could not re-check it at ${sha}.`;
+  const unchecked = inReview ? `Could not re-check it at ${sha}.` : `Not re-checked at ${sha}: its file did not fit in this review.`;
+  const status = verdict ? `Still present at ${sha}.${why}` : unchecked;
   return `${status} Dismissed on your reply, so it no longer counts against the score.`;
 }
 function ranges(lines) {
@@ -17509,7 +17510,7 @@ ${text}` : "";
         if (p.status !== "open") return p;
         const c = checked.find((x) => x.previous === p);
         if (replies.has(p.fp)) {
-          acks.set(p.fp, answerReply(c?.verdict, sha));
+          acks.set(p.fp, answerReply(c?.verdict, sha, diffs.some((d) => d.path === p.file)));
           return { ...p, status: "dismissed" };
         }
         if (!c?.verdict) return p;

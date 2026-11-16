@@ -288,7 +288,7 @@ async function main() {
         if (p.status !== "open") return p;
         const c = checked.find((x) => x.previous === p);
         if (replies.has(p.fp)) {
-          acks.set(p.fp, answerReply(c?.verdict, sha));
+          acks.set(p.fp, answerReply(c?.verdict, sha, diffs.some((d) => d.path === p.file)));
           return { ...p, status: "dismissed" as const };
         }
         if (!c?.verdict) return p;
