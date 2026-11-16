@@ -52,7 +52,7 @@ function toolSpec(name: string, description: string, schema: type.Any): ToolSpec
 /** A find agent's answer: its candidates, and the files it says it checked. */
 type FindResult = { findings: Finding[]; checked: Set<string> };
 
-function submitFindings(changed: readonly string[]): Submit<FindResult> {
+export function submitFindings(changed: readonly string[]): Submit<FindResult> {
   return {
     spec: toolSpec("submit_findings", "Submit the review. Call once, after checking every changed file.", Findings),
     parse(args, final) {
@@ -267,11 +267,23 @@ export function inFile(file: string, limits: Limits): boolean {
  * a reviewer tuned for recall finds a minor nit in almost any of them, so without a higher bar
  * on follow-ups the score never settles. Earlier findings are not affected.
  */
-export const newFindingRank = (config: Config, incremental: boolean): number =>
+export const newFindingRank = (config: Config, followUp: boolean): number =>
   Math.min(
     SEVERITIES.indexOf(config.review.min_severity),
-    incremental ? SEVERITIES.indexOf(config.review.follow_up_min_severity) : SEVERITIES.length,
+    followUp ? SEVERITIES.indexOf(config.review.follow_up_min_severity) : SEVERITIES.length,
   );
+
+/**
+ * ReviewPilot's answer on the thread of an open finding the PR author or a maintainer replied
+ * to, given its re-check (undefined when the check failed). The finding is always closed as
+ * dismissed: a rejection can mean fixed or intended, and only dismissed is never raised again.
+ */
+export function answerReply(verdict: VerdictResult | undefined, sha: string): string {
+  const why = verdict ? ` ${verdict.reason.replace(/\s+/g, " ").trim().slice(0, 400)}` : "";
+  if (verdict?.verdict === "rejected") return `Checked at ${sha}: your reply holds.${why}`;
+  const status = verdict ? `Still present at ${sha}.${why}` : `Could not re-check it at ${sha}.`;
+  return `${status} Dismissed on your reply, so it no longer counts against the score.`;
+}
 
 /** "12-15, 40" for a set of line numbers. */
 export function ranges(lines: ReadonlySet<number>): string {
@@ -330,6 +342,8 @@ export type ReviewInput = {
   previous: readonly Tracked[];
   /** Where new findings may land (see reportable). */
   limits: Limits;
+  /** A push after an earlier review (not `/review`): new findings must clear follow_up_min_severity. */
+  followUp: boolean;
   /** Files whose diff moved since the last review: their earlier findings are checked again. */
   changed: ReadonlySet<string>;
   /** Open findings the PR author or a maintainer replied to, by fingerprint, with the reply: always checked again. */
@@ -412,12 +426,12 @@ export async function review(
   const inBounds = real.filter((c) => inFile(c.file, input.limits));
   if (inBounds.length < real.length) log(`find: dropped ${real.length - inBounds.length} candidates in files this review does not cover`);
   // Below the follow-up bar is dropped before verification, which also saves its cost.
-  const rank = newFindingRank(config, input.limits.incremental);
+  const rank = newFindingRank(config, input.followUp);
   const found = inBounds
     .filter((c) => SEVERITIES.indexOf(c.severity) <= rank)
     .map(({ rule, ...c }) => (rule && ruleIds.has(rule) ? { ...c, rule } : c))
     .sort(bySeverity);
-  if (found.length < inBounds.length) log(`find: dropped ${inBounds.length - found.length} candidates less severe than ${SEVERITIES[rank]}${input.limits.incremental ? " (follow-up review)" : ""}`);
+  if (found.length < inBounds.length) log(`find: dropped ${inBounds.length - found.length} candidates less severe than ${SEVERITIES[rank]}${input.followUp ? " (follow-up review)" : ""}`);
   log(`find: ${found.length} candidates${found.length > MAX_VERIFY ? `, verifying the ${MAX_VERIFY} most severe` : ""}`);
 
   // An earlier finding is re-checked only when its file is in the PR's diff (without it the

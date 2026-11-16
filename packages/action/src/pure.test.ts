@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { DEFAULTS, ignored, loadConfig, rulesFor } from "./config.ts";
 import { anchor, type FileDiff, parseDiff, unquote } from "./diff.ts";
 import { blockers, checkResult, clean, summaryBody } from "./render.ts";
-import { chunk, focus, inFile, type Limits, newFindingRank, nextFiles, ranges, reportable, settle, stale } from "./review.ts";
+import { answerReply, chunk, focus, inFile, type Limits, newFindingRank, nextFiles, ranges, reportable, settle, stale, submitFindings } from "./review.ts";
 import { diffHash, findingTag, fingerprint, postedOnHead, readState, score, STATE_BUDGET, writeState } from "./state.ts";
 
 const DIFF = `diff --git a/src/a.ts b/src/a.ts
@@ -262,6 +262,22 @@ test("after the first review, pushes raise only major and critical findings unle
   assert.equal(rank("review:\n  follow_up_min_severity: minor\n", true), 2);
   // min_severity still wins when it is stricter.
   assert.equal(rank("review:\n  min_severity: critical\n", true), 0);
+});
+
+test("a reply closes its finding with an answer that says what the re-check found", () => {
+  const verdict = (v: "confirmed" | "rejected") => ({ verdict: v, reason: "Line 4\n  guards it.", evidence: [], severity: "minor" as const });
+  assert.equal(answerReply(verdict("rejected"), "abc1234"), "Checked at abc1234: your reply holds. Line 4 guards it.");
+  assert.match(answerReply(verdict("confirmed"), "abc1234"), /^Still present at abc1234\. Line 4 guards it\. Dismissed on your reply/);
+  assert.match(answerReply(undefined, "abc1234"), /^Could not re-check it at abc1234\. Dismissed/);
+});
+
+test("an agent out of budget still records the files it lists; before that, it must cover them all", () => {
+  const submit = submitFindings(["a.ts", "b.ts"]);
+  const args = { checked_files: ["./a.ts"], findings: [] };
+  assert.equal(submit.parse(args, false).ok, false);
+  const forced = submit.parse(args, true);
+  assert.ok(forced.ok);
+  assert.deepEqual([...forced.value.checked], ["a.ts"]);
 });
 
 test("an earlier finding is re-verified only when its file or cited code changed", () => {

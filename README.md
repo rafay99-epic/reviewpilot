@@ -28,7 +28,7 @@ The score comes from the verified findings, never from the model's opinion, so i
 | 2/5 | A critical issue (security, privacy, data loss, broken build) |
 | 1/5 | Several critical issues |
 
-On every push, earlier findings are re-checked: they show as fixed, still open, or new. A fixed finding gets a "Fixed in" reply and its comment is collapsed as outdated; the thread is also resolved when the token has Contents write (GitHub requires it for Apps to resolve threads). Reply to a finding ("fixed in…", "intended because…") and the next review checks your reply against the code, answers on the thread, and closes it: fixed if the code bears it out, dismissed otherwise. A finding whose thread you resolve is dismissed. Neither is raised again. After the first review, a push raises only major and critical findings (`review.follow_up_min_severity`), so fix rounds settle instead of trading one nit for the next.
+On every push, earlier findings are re-checked: they show as fixed, still open, or new. A fixed finding gets a "Fixed in" reply and its comment is collapsed as outdated; the thread is also resolved when the token has Contents write (GitHub requires it for Apps to resolve threads). Reply to a finding ("fixed in…", "intended because…") and the next review checks your reply against the code, answers on the thread with what it found, and closes the finding as dismissed. A finding whose thread you resolve is dismissed too. Neither is raised again. After the first review, a push raises only major and critical findings (`review.follow_up_min_severity`), so fix rounds settle instead of trading one nit for the next.
 
 ## Use it
 

@@ -17125,10 +17125,16 @@ function inFile(file, limits) {
   if (limits.incremental && !limits.scope.some((d) => d.path === file)) return false;
   return limits.diffs.some((d) => d.path === file);
 }
-var newFindingRank = (config, incremental) => Math.min(
+var newFindingRank = (config, followUp) => Math.min(
   SEVERITIES.indexOf(config.review.min_severity),
-  incremental ? SEVERITIES.indexOf(config.review.follow_up_min_severity) : SEVERITIES.length
+  followUp ? SEVERITIES.indexOf(config.review.follow_up_min_severity) : SEVERITIES.length
 );
+function answerReply(verdict, sha) {
+  const why = verdict ? ` ${verdict.reason.replace(/\s+/g, " ").trim().slice(0, 400)}` : "";
+  if (verdict?.verdict === "rejected") return `Checked at ${sha}: your reply holds.${why}`;
+  const status = verdict ? `Still present at ${sha}.${why}` : `Could not re-check it at ${sha}.`;
+  return `${status} Dismissed on your reply, so it no longer counts against the score.`;
+}
 function ranges(lines) {
   const sorted = [...lines].sort((a, b) => a - b);
   const out = [];
@@ -17211,9 +17217,9 @@ ${d.numbered}`;
   if (real.length < candidates.length) log2(`find: dropped ${candidates.length - real.length} candidates citing files not in the repo`);
   const inBounds = real.filter((c) => inFile(c.file, input2.limits));
   if (inBounds.length < real.length) log2(`find: dropped ${real.length - inBounds.length} candidates in files this review does not cover`);
-  const rank = newFindingRank(config, input2.limits.incremental);
+  const rank = newFindingRank(config, input2.followUp);
   const found = inBounds.filter((c) => SEVERITIES.indexOf(c.severity) <= rank).map(({ rule, ...c }) => rule && ruleIds.has(rule) ? { ...c, rule } : c).sort(bySeverity);
-  if (found.length < inBounds.length) log2(`find: dropped ${inBounds.length - found.length} candidates less severe than ${SEVERITIES[rank]}${input2.limits.incremental ? " (follow-up review)" : ""}`);
+  if (found.length < inBounds.length) log2(`find: dropped ${inBounds.length - found.length} candidates less severe than ${SEVERITIES[rank]}${input2.followUp ? " (follow-up review)" : ""}`);
   log2(`find: ${found.length} candidates${found.length > MAX_VERIFY ? `, verifying the ${MAX_VERIFY} most severe` : ""}`);
   const changedPaths = input2.changed;
   const recheck = open.filter((p) => diffs.some((d) => d.path === p.file));
@@ -17319,7 +17325,6 @@ var MAX_DIFF_CHARS = 4e5;
 var STALE_CHECK_MS = 60 * 6e4;
 var GUIDANCE_CHARS = 1e4;
 var MAINTAINERS = /* @__PURE__ */ new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-var flatReason = (text) => text.replace(/\s+/g, " ").trim().slice(0, 400);
 var input = (name) => process.env[`INPUT_${name.toUpperCase()}`]?.trim() || void 0;
 var log = createLog(process.env.GITHUB_ACTIONS === "true");
 var Event = type({
@@ -17476,6 +17481,7 @@ ${text}` : "";
     }) : void 0;
     const { scope: scope2, fresh: freshLines, changed } = focus(diffs, seen, since);
     const limits = { diffs, scope: scope2, fresh: freshLines, incremental: seen !== void 0, outside: config.review.outside_diff };
+    const followUp = !comment && prev !== void 0;
     const { checked, candidates, verified, failedParts, parts, reviewed, findMs, verifyMs } = await log.phase(
       "Review",
       () => review({
@@ -17490,6 +17496,7 @@ ${text}` : "";
         scope: scope2,
         previous,
         limits,
+        followUp,
         changed,
         replies,
         log: log.line
@@ -17502,12 +17509,7 @@ ${text}` : "";
         if (p.status !== "open") return p;
         const c = checked.find((x) => x.previous === p);
         if (replies.has(p.fp)) {
-          const why = c?.verdict ? ` ${flatReason(c.verdict.reason)}` : "";
-          if (c?.verdict?.verdict === "rejected") {
-            acks.set(p.fp, `Checked at ${sha}: no longer an issue.${why}`);
-            return { ...p, status: "fixed" };
-          }
-          acks.set(p.fp, `${c?.verdict ? `Still present at ${sha}.${why}` : `Could not re-check it at ${sha}.`} Dismissed on your reply, so it no longer counts against the score.`);
+          acks.set(p.fp, answerReply(c?.verdict, sha));
           return { ...p, status: "dismissed" };
         }
         if (!c?.verdict) return p;
@@ -17515,7 +17517,7 @@ ${text}` : "";
         const { line, endLine, severity } = settle(p, c.verdict);
         return { ...p, line, endLine, severity };
       });
-      const newRank = newFindingRank(config, limits.incremental);
+      const newRank = newFindingRank(config, followUp);
       const confirmed = checked.flatMap((c) => !c.previous && c.verdict?.verdict === "confirmed" ? [settle(c.finding, c.verdict)] : []).filter((f) => SEVERITIES.indexOf(f.severity) <= newRank && reportable(f, limits)).sort(bySeverity);
       const known = findings2.filter((t) => t.status !== "fixed");
       const fresh2 = [];

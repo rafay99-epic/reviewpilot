@@ -11,7 +11,7 @@ import { type CheckUpdate, createGitHub, type InlineComment, type Thread } from 
 import { createLlm } from "./llm.ts";
 import { createLog, seconds } from "./log.ts";
 import { bySeverity, checkResult, clean, inlineBody, PROGRESS, progressBody, summaryBody } from "./render.ts";
-import { dedupe, focus, type Limits, newFindingRank, nextFiles, pool, reportable, review, settle } from "./review.ts";
+import { answerReply, dedupe, focus, type Limits, newFindingRank, nextFiles, pool, reportable, review, settle } from "./review.ts";
 import {
   FINDING_TAG,
   fingerprint,
@@ -33,9 +33,6 @@ const STALE_CHECK_MS = 60 * 60_000;
 const GUIDANCE_CHARS = 10_000;
 /** Who may run /review and whose replies can dismiss a finding (besides the PR author). */
 const MAINTAINERS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
-
-/** The verifier's reason as one line for a thread reply. */
-const flatReason = (text: string) => text.replace(/\s+/g, " ").trim().slice(0, 400);
 
 const input = (name: string) => process.env[`INPUT_${name.toUpperCase()}`]?.trim() || undefined;
 const log = createLog(process.env.GITHUB_ACTIONS === "true");
@@ -258,6 +255,8 @@ async function main() {
       : undefined;
     const { scope, fresh: freshLines, changed } = focus(diffs, seen, since);
     const limits: Limits = { diffs, scope, fresh: freshLines, incremental: seen !== undefined, outside: config.review.outside_diff };
+    // Any push after an earlier review, whatever review.scope says; `/review` is a full review.
+    const followUp = !comment && prev !== undefined;
     const { checked, candidates, verified, failedParts, parts, reviewed, findMs, verifyMs } = await log.phase("Review", () =>
       review({
         find,
@@ -271,6 +270,7 @@ async function main() {
         scope,
         previous,
         limits,
+        followUp,
         changed,
         replies,
         log: log.line,
@@ -282,18 +282,13 @@ async function main() {
     const sha = pr.head.sha.slice(0, 7);
     const { findings, fresh, notes, overCap } = await log.phase("Merge", async () => {
       // Earlier open findings stay open, become fixed, or stay as they were when the check
-      // failed. One the author replied to always closes: fixed if the code bears the reply
-      // out, otherwise dismissed on the reply, as before. Either way the thread is answered.
+      // failed. One the author replied to closes as dismissed, as before, but now with an
+      // answer on its thread saying what the re-check found (see answerReply).
       const findings: Tracked[] = previous.map((p) => {
         if (p.status !== "open") return p;
         const c = checked.find((x) => x.previous === p);
         if (replies.has(p.fp)) {
-          const why = c?.verdict ? ` ${flatReason(c.verdict.reason)}` : "";
-          if (c?.verdict?.verdict === "rejected") {
-            acks.set(p.fp, `Checked at ${sha}: no longer an issue.${why}`);
-            return { ...p, status: "fixed" as const };
-          }
-          acks.set(p.fp, `${c?.verdict ? `Still present at ${sha}.${why}` : `Could not re-check it at ${sha}.`} Dismissed on your reply, so it no longer counts against the score.`);
+          acks.set(p.fp, answerReply(c?.verdict, sha));
           return { ...p, status: "dismissed" as const };
         }
         if (!c?.verdict) return p;
@@ -305,7 +300,7 @@ async function main() {
       });
       // The verifier can move a finding; one it moved out of bounds is dropped like any other.
       // The verifier may lower a severity, so the bar for new findings applies again here.
-      const newRank = newFindingRank(config, limits.incremental);
+      const newRank = newFindingRank(config, followUp);
       const confirmed = checked
         .flatMap((c) => (!c.previous && c.verdict?.verdict === "confirmed" ? [settle(c.finding, c.verdict)] : []))
         .filter((f) => SEVERITIES.indexOf(f.severity) <= newRank && reportable(f, limits))
@@ -371,7 +366,7 @@ async function main() {
     }
     const wasOpen = new Set(prev?.findings.filter((p) => p.status === "open").map((p) => p.fp));
     const fixedNow = findings.filter((f) => f.status === "fixed" && wasOpen.has(f.fp));
-    // Threads to answer and close: everything fixed, plus findings dismissed on a reply.
+    // Threads to answer and close: everything fixed, plus findings closed on a reply.
     const closing = findings.filter((f) => wasOpen.has(f.fp) && (f.status === "fixed" || acks.has(f.fp)));
 
     const warningText = [
