@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { DEFAULTS, ignored, loadConfig, rulesFor } from "./config.ts";
 import { anchor, type FileDiff, parseDiff, unquote } from "./diff.ts";
 import { blockers, checkResult, clean, summaryBody } from "./render.ts";
-import { chunk, focus, inFile, type Limits, nextFiles, ranges, reportable, settle, stale } from "./review.ts";
+import { chunk, focus, inFile, type Limits, newFindingRank, nextFiles, ranges, reportable, settle, stale } from "./review.ts";
 import { diffHash, findingTag, fingerprint, postedOnHead, readState, score, STATE_BUDGET, writeState } from "./state.ts";
 
 const DIFF = `diff --git a/src/a.ts b/src/a.ts
@@ -253,6 +253,15 @@ test("review.scope picks changed files or the whole PR on a push", () => {
   assert.equal(loadConfig(undefined).config.review.scope, "changed");
   assert.equal(loadConfig("review:\n  scope: all\n").config.review.scope, "all");
   assert.match(loadConfig("review:\n  scope: everything\n").warning ?? "", /scope/);
+});
+
+test("after the first review, pushes raise only major and critical findings unless configured", () => {
+  const rank = (yaml: string | undefined, incremental: boolean) => newFindingRank(loadConfig(yaml).config, incremental);
+  assert.equal(rank(undefined, false), 2); // first review: minor and up
+  assert.equal(rank(undefined, true), 1); // follow-up: major and up
+  assert.equal(rank("review:\n  follow_up_min_severity: minor\n", true), 2);
+  // min_severity still wins when it is stricter.
+  assert.equal(rank("review:\n  min_severity: critical\n", true), 0);
 });
 
 test("an earlier finding is re-verified only when its file or cited code changed", () => {

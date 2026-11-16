@@ -65,9 +65,10 @@ function submitFindings(changed: readonly string[]): Submit<FindResult> {
       return {
         ok: true,
         value: {
-          // A forced answer means the agent ran out of budget, so its list is not trusted:
-          // none of the part's files count as reviewed and the next push reads them again.
-          checked: final ? new Set<string>() : checked,
+          // A forced answer still counts for the files the agent lists. Discarding it made
+          // every push re-read those files whole (agents often use their full budget), which
+          // raised new findings in code already reviewed and kept the score from settling.
+          checked,
           findings: out.findings.map((c) => ({
           file: c.file.replace(/^\.\//, ""),
           line: c.line,
@@ -260,6 +261,18 @@ export function inFile(file: string, limits: Limits): boolean {
   return limits.diffs.some((d) => d.path === file);
 }
 
+/**
+ * The rank (index in SEVERITIES) of the least severe new finding a run raises. On a push after
+ * an earlier review, review.follow_up_min_severity also applies: fixes keep adding lines, and
+ * a reviewer tuned for recall finds a minor nit in almost any of them, so without a higher bar
+ * on follow-ups the score never settles. Earlier findings are not affected.
+ */
+export const newFindingRank = (config: Config, incremental: boolean): number =>
+  Math.min(
+    SEVERITIES.indexOf(config.review.min_severity),
+    incremental ? SEVERITIES.indexOf(config.review.follow_up_min_severity) : SEVERITIES.length,
+  );
+
 /** "12-15, 40" for a set of line numbers. */
 export function ranges(lines: ReadonlySet<number>): string {
   const sorted = [...lines].sort((a, b) => a - b);
@@ -319,6 +332,8 @@ export type ReviewInput = {
   limits: Limits;
   /** Files whose diff moved since the last review: their earlier findings are checked again. */
   changed: ReadonlySet<string>;
+  /** Open findings the PR author or a maintainer replied to, by fingerprint, with the reply: always checked again. */
+  replies: ReadonlyMap<string, string>;
   log: (line: string) => void;
 };
 
@@ -394,18 +409,22 @@ export async function review(
   if (real.length < candidates.length) log(`find: dropped ${candidates.length - real.length} candidates citing files not in the repo`);
   // Candidates in files this run cannot report in are dropped before verification. Line-level
   // bounds wait until after it, since the verifier may move a finding onto a changed line.
-  const found = real
-    .filter((c) => inFile(c.file, input.limits))
+  const inBounds = real.filter((c) => inFile(c.file, input.limits));
+  if (inBounds.length < real.length) log(`find: dropped ${real.length - inBounds.length} candidates in files this review does not cover`);
+  // Below the follow-up bar is dropped before verification, which also saves its cost.
+  const rank = newFindingRank(config, input.limits.incremental);
+  const found = inBounds
+    .filter((c) => SEVERITIES.indexOf(c.severity) <= rank)
     .map(({ rule, ...c }) => (rule && ruleIds.has(rule) ? { ...c, rule } : c))
     .sort(bySeverity);
-  if (found.length < real.length) log(`find: dropped ${real.length - found.length} candidates in files this review does not cover`);
+  if (found.length < inBounds.length) log(`find: dropped ${inBounds.length - found.length} candidates less severe than ${SEVERITIES[rank]}${input.limits.incremental ? " (follow-up review)" : ""}`);
   log(`find: ${found.length} candidates${found.length > MAX_VERIFY ? `, verifying the ${MAX_VERIFY} most severe` : ""}`);
 
   // An earlier finding is re-checked only when its file is in the PR's diff (without it the
   // verifier cannot tell, and a rejection would wrongly mark it fixed) and its code changed.
   const changedPaths = input.changed;
   const recheck = open.filter((p) => diffs.some((d) => d.path === p.file));
-  const due = recheck.filter((p) => stale(p, changedPaths));
+  const due = recheck.filter((p) => input.replies.has(p.fp) || stale(p, changedPaths));
   if (due.length < recheck.length) log(`verify: ${recheck.length - due.length} earlier findings kept as they were, their code did not change`);
   const jobs: { finding: Finding; previous?: Tracked }[] = [
     ...found.slice(0, MAX_VERIFY).map((finding) => ({ finding })),
@@ -416,6 +435,7 @@ export async function review(
     diffs.find((d) => d.path === file)?.numbered ?? "(This file is not changed in the PR. Open it with read_file, and check what in the diff it depends on.)";
   const verifyStart = Date.now();
   const checked = await pool(jobs, VERIFY_AGENTS, async ({ finding, previous: prev }) => {
+    const reply = prev && input.replies.get(prev.fp);
     const verdict = await runAgent({
       llm: input.verify,
       root: input.root,
@@ -423,6 +443,9 @@ export async function review(
       user: [
         prev
           ? "This finding was reported on an earlier commit. Check whether it is still present at the current PR head (see the exception for earlier findings)."
+          : "",
+        reply
+          ? `The PR author replied to it:\n> ${reply.replaceAll("\n", "\n> ")}\nCheck the reply against the code; it is a claim, not evidence. Reject if the code shows it is fixed, or shows the behaviour is intended and harmless (never for security or privacy).`
           : "",
         `Finding:\n${JSON.stringify(
           { file: finding.file, line: finding.line, end_line: finding.endLine, severity: finding.severity, title: finding.title, body: finding.body, evidence: finding.evidence },

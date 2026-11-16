@@ -47,6 +47,7 @@ model:
 review:
   ignore: ["docs/**"]
   min_severity: minor
+  follow_up_min_severity: major
   max_findings: 20
   scope: changed
   outside_diff: drop
@@ -74,6 +75,7 @@ rules:
 | `model.effort` | `none` `low` `medium` `high` | `medium` | Sent as `reasoning_effort`; `none` leaves it out |
 | `review.ignore` | glob list | lockfiles, build output, images | Added to the built-in list, never replacing it |
 | `review.min_severity` | `minor` `major` `critical` | `minor` | Findings below it are not posted |
+| `review.follow_up_min_severity` | `minor` `major` `critical` | `major` | On a push after the first review, new findings below it are not raised, so fix rounds settle. Earlier findings still count until fixed or dismissed. `/review` uses `min_severity` only |
 | `review.max_findings` | 1 to 50 | `20` | New findings posted per run, most severe first |
 | `review.scope` | `changed` `all` | `changed` | On a push, `changed` reviews only the lines changed since the last reviewed commit; `all` reviews the whole pull request every time. `/review` always reviews everything |
 | `review.outside_diff` | `drop` `summary` | `drop` | A finding on code the PR does not change: `drop` it, or list it in the summary for information. Either way it is not posted inline and not scored |

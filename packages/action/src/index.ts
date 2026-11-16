@@ -10,8 +10,8 @@ import { changedSince, checkoutPr, diff, fetchRef, readAt } from "./git.ts";
 import { type CheckUpdate, createGitHub, type InlineComment, type Thread } from "./github.ts";
 import { createLlm } from "./llm.ts";
 import { createLog, seconds } from "./log.ts";
-import { bySeverity, checkResult, inlineBody, PROGRESS, progressBody, summaryBody } from "./render.ts";
-import { dedupe, focus, type Limits, nextFiles, pool, reportable, review, settle } from "./review.ts";
+import { bySeverity, checkResult, clean, inlineBody, PROGRESS, progressBody, summaryBody } from "./render.ts";
+import { dedupe, focus, type Limits, newFindingRank, nextFiles, pool, reportable, review, settle } from "./review.ts";
 import {
   FINDING_TAG,
   fingerprint,
@@ -33,6 +33,9 @@ const STALE_CHECK_MS = 60 * 60_000;
 const GUIDANCE_CHARS = 10_000;
 /** Who may run /review and whose replies can dismiss a finding (besides the PR author). */
 const MAINTAINERS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+
+/** The verifier's reason as one line for a thread reply. */
+const flatReason = (text: string) => text.replace(/\s+/g, " ").trim().slice(0, 400);
 
 const input = (name: string) => process.env[`INPUT_${name.toUpperCase()}`]?.trim() || undefined;
 const log = createLog(process.env.GITHUB_ACTIONS === "true");
@@ -217,10 +220,12 @@ async function main() {
       );
 
     // Earlier findings. One counts as dismissed when someone other than ReviewPilot resolved
-    // its thread (only the PR author and people with write access can), or when the PR author
-    // or a maintainer replied to it. Findings now below min_severity are dropped too.
+    // its thread (only the PR author and people with write access can), or when it is now
+    // below min_severity. A reply from the PR author or a maintainer ("fixed in", "intended")
+    // is checked against the code this run, and the finding closes either way (see Merge).
     const minRank = SEVERITIES.indexOf(config.review.min_severity);
     const previous: Tracked[] = (prev?.findings ?? []).map((f) => ({ ...f }));
+    const replies = new Map<string, string>();
     for (const p of previous.filter((f) => f.status === "open")) {
       // The PR no longer changes this file (reverted, or now ignored): nothing left to check.
       if (!touched.has(p.file)) {
@@ -228,9 +233,13 @@ async function main() {
         continue;
       }
       const t = threadOf(p);
-      const replied = t?.comments.slice(1).some((c) => c.author === pr.user.login || MAINTAINERS.has(c.association));
       const resolved = t?.resolved && !ours(t.resolvedBy);
-      if (resolved || replied || SEVERITIES.indexOf(p.severity) > minRank) p.status = "dismissed";
+      if (resolved || SEVERITIES.indexOf(p.severity) > minRank) {
+        p.status = "dismissed";
+        continue;
+      }
+      const reply = t?.comments.slice(1).findLast((c) => !ours(c.author) && (c.author === pr.user.login || MAINTAINERS.has(c.association)));
+      if (reply) replies.set(p.fp, reply.body.slice(0, 1500));
     }
 
     const llm = (m: string) => createLlm({ baseUrl, apiKey, model: m, effort: config.model.effort });
@@ -263,15 +272,30 @@ async function main() {
         previous,
         limits,
         changed,
+        replies,
         log: log.line,
       }),
     );
 
+    // What ReviewPilot replies on the thread of each earlier finding this run closes.
+    const acks = new Map<string, string>();
+    const sha = pr.head.sha.slice(0, 7);
     const { findings, fresh, notes, overCap } = await log.phase("Merge", async () => {
-      // Earlier open findings stay open, become fixed, or stay as they were when the check failed.
+      // Earlier open findings stay open, become fixed, or stay as they were when the check
+      // failed. One the author replied to always closes: fixed if the code bears the reply
+      // out, otherwise dismissed on the reply, as before. Either way the thread is answered.
       const findings: Tracked[] = previous.map((p) => {
         if (p.status !== "open") return p;
         const c = checked.find((x) => x.previous === p);
+        if (replies.has(p.fp)) {
+          const why = c?.verdict ? ` ${flatReason(c.verdict.reason)}` : "";
+          if (c?.verdict?.verdict === "rejected") {
+            acks.set(p.fp, `Checked at ${sha}: no longer an issue.${why}`);
+            return { ...p, status: "fixed" as const };
+          }
+          acks.set(p.fp, `${c?.verdict ? `Still present at ${sha}.${why}` : `Could not re-check it at ${sha}.`} Dismissed on your reply, so it no longer counts against the score.`);
+          return { ...p, status: "dismissed" as const };
+        }
         if (!c?.verdict) return p;
         if (c.verdict.verdict !== "confirmed") return { ...p, status: "fixed" as const };
         // Keep the original wording so the summary matches the inline thread; only the
@@ -280,9 +304,11 @@ async function main() {
         return { ...p, line, endLine, severity };
       });
       // The verifier can move a finding; one it moved out of bounds is dropped like any other.
+      // The verifier may lower a severity, so the bar for new findings applies again here.
+      const newRank = newFindingRank(config, limits.incremental);
       const confirmed = checked
         .flatMap((c) => (!c.previous && c.verdict?.verdict === "confirmed" ? [settle(c.finding, c.verdict)] : []))
-        .filter((f) => SEVERITIES.indexOf(f.severity) <= minRank && reportable(f, limits))
+        .filter((f) => SEVERITIES.indexOf(f.severity) <= newRank && reportable(f, limits))
         .sort(bySeverity);
       // Drop findings that repeat each other or an earlier open or dismissed one. A finding
       // that matches a fixed one was reintroduced: it replaces the fixed entry and posts again.
@@ -345,6 +371,8 @@ async function main() {
     }
     const wasOpen = new Set(prev?.findings.filter((p) => p.status === "open").map((p) => p.fp));
     const fixedNow = findings.filter((f) => f.status === "fixed" && wasOpen.has(f.fp));
+    // Threads to answer and close: everything fixed, plus findings dismissed on a reply.
+    const closing = findings.filter((f) => wasOpen.has(f.fp) && (f.status === "fixed" || acks.has(f.fp)));
 
     const warningText = [
       warning,
@@ -415,12 +443,13 @@ async function main() {
         if (old.id !== summaryId) await gh.retire(old).catch((e: unknown) => log.warn(`Could not retire summary ${old.id}: ${String(e)}`));
       }
 
-      // Close what got fixed: a "Fixed in" reply, then collapse the comment and resolve the
-      // thread. Two at a time stays under GitHub's secondary rate limit on new comments.
+      // Close what got fixed or was dismissed on a reply: answer on the thread, then collapse
+      // the comment and resolve the thread. Two at a time stays under GitHub's secondary rate
+      // limit on new comments.
       let unresolved = 0;
-      await pool(fixedNow, 2, async (f) => {
+      await pool(closing, 2, async (f) => {
         if (f.commentId !== undefined) {
-          await gh.reply(number, f.commentId, `Fixed in ${pr.head.sha.slice(0, 7)}.`).catch((e: unknown) => log.warn(`Reply on ${f.fp} failed: ${String(e)}`));
+          await gh.reply(number, f.commentId, clean(acks.get(f.fp) ?? `Fixed in ${sha}.`)).catch((e: unknown) => log.warn(`Reply on ${f.fp} failed: ${String(e)}`));
         }
         const t = threadOf(f);
         if (!t || t.resolved) return;
@@ -433,7 +462,9 @@ async function main() {
       if (unresolved) log.line(`${unresolved} fixed threads collapsed but left unresolved: resolving needs Contents write on the token.`);
 
       // Files skipped, parts that failed, or candidates whose check failed: not a full review.
-      const partial = failedParts > 0 || checked.some((c) => !c.verdict) ? "incomplete" : skipped > 0 ? "skipped" : false;
+      // A replied-to finding whose re-check failed is still settled (dismissed on the reply).
+      const unsettled = checked.some((c) => !c.verdict && !(c.previous && replies.has(c.previous.fp)));
+      const partial = failedParts > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
       const result = checkResult(state, run, `https://github.com/${repo}/pull/${number}#issuecomment-${summaryId}`, partial, config.review.pass_score);
       // One bad annotation fails the whole update; the check must not stay "in progress".
       const finished = checkId !== undefined && (await gh.updateCheck(checkId, { status: "completed", completed_at: new Date().toISOString(), ...result }).then(() => true, () => false));
