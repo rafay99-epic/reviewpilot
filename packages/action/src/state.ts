@@ -44,6 +44,9 @@ const StateSchema = type({
 });
 
 export type Finding = typeof FindingSchema.infer;
+/** Which reviewer a finding came from. Stored only for UI findings (see `lens`). */
+export type Lens = "code" | "ui";
+export const lensOf = (f: Pick<Finding, "lens">): Lens => f.lens ?? "code";
 export type Tracked = typeof TrackedSchema.infer;
 export type State = typeof StateSchema.infer;
 export type Score = State["score"];
@@ -64,8 +67,8 @@ export function score(findings: readonly Pick<Finding, "severity">[]): Score {
  * The state as one lens sees it: its findings and its score. Render and the check work on a
  * State, so each lens gets its own summary lines and check without a second code path.
  */
-export function lensView(state: State, lens: "code" | "ui"): State {
-  const findings = state.findings.filter((f) => (f.lens === "ui") === (lens === "ui"));
+export function lensView(state: State, lens: Lens): State {
+  const findings = state.findings.filter((f) => lensOf(f) === lens);
   return { ...state, findings, score: lens === "ui" ? (state.uiScore ?? 5) : state.score };
 }
 
@@ -78,9 +81,12 @@ export function fingerprint(f: Pick<Finding, "file" | "title">): string {
 /** Hash of one file's PR diff: unchanged across pushes means nothing new to find in it. */
 export const diffHash = (numbered: string) => createHash("sha1").update(numbered).digest("hex").slice(0, 12);
 
-/** A new finding within two lines of an earlier one in the same file is treated as the same finding. */
-export function sameIssue(a: Pick<Finding, "file" | "line">, b: Pick<Finding, "file" | "line">): boolean {
-  return a.file === b.file && Math.abs(a.line - b.line) <= 2;
+/**
+ * A new finding within two lines of an earlier one in the same file, from the same lens, is
+ * treated as the same finding. A design nit next to a bug is a different finding.
+ */
+export function sameIssue(a: Pick<Finding, "file" | "line" | "lens">, b: Pick<Finding, "file" | "line" | "lens">): boolean {
+  return a.file === b.file && lensOf(a) === lensOf(b) && Math.abs(a.line - b.line) <= 2;
 }
 
 /** The last match of a marker in a body: ReviewPilot writes its own markers at the end. */

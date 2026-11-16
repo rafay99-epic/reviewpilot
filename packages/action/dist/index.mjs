@@ -16016,6 +16016,7 @@ var StateSchema = type({
   findings: TrackedSchema.array(),
   "files?": "Record<string, string>"
 });
+var lensOf = (f) => f.lens ?? "code";
 function score(findings) {
   const critical = findings.filter((f) => f.severity === "critical").length;
   if (critical >= 2) return 1;
@@ -16024,7 +16025,7 @@ function score(findings) {
   return findings.length > 0 ? 4 : 5;
 }
 function lensView(state, lens) {
-  const findings = state.findings.filter((f) => f.lens === "ui" === (lens === "ui"));
+  const findings = state.findings.filter((f) => lensOf(f) === lens);
   return { ...state, findings, score: lens === "ui" ? state.uiScore ?? 5 : state.score };
 }
 function fingerprint(f) {
@@ -16034,7 +16035,7 @@ ${title}`).digest("hex").slice(0, 12);
 }
 var diffHash = (numbered) => createHash("sha1").update(numbered).digest("hex").slice(0, 12);
 function sameIssue(a, b) {
-  return a.file === b.file && Math.abs(a.line - b.line) <= 2;
+  return a.file === b.file && lensOf(a) === lensOf(b) && Math.abs(a.line - b.line) <= 2;
 }
 var lastMarker = (body, marker) => [...body.matchAll(marker)].at(-1)?.[1];
 var MARKER = /<!-- reviewpilot:state ([A-Za-z0-9+/=]+) -->/g;
@@ -16827,6 +16828,13 @@ function chunk(diffs, size) {
   if (current.length) parts.push(current);
   return parts;
 }
+function findParts(scope2, uiPaths) {
+  const ui = uiPaths ? scope2.filter((d) => uiPaths.some((g) => matchesGlob2(d.path, g))) : [];
+  return [
+    ...chunk(scope2, CHUNK_CHARS).map((files) => ({ files, lens: "code" })),
+    ...chunk(ui, CHUNK_CHARS).map((files) => ({ files, lens: "ui" }))
+  ];
+}
 function focus(diffs, seen, since) {
   const fresh = /* @__PURE__ */ new Map();
   if (!seen) return { scope: [...diffs], fresh, changed: new Set(diffs.map((d) => d.path)) };
@@ -16908,14 +16916,11 @@ async function review(input2) {
   ].filter(Boolean);
   const all = diffs.map((d) => `- ${d.path} (${d.status})`).join("\n");
   const ui = input2.ui;
-  const uiScope = ui ? input2.scope.filter((d) => ui.paths.some((g) => matchesGlob2(d.path, g))) : [];
-  const codeChunks = chunk(input2.scope, CHUNK_CHARS);
-  const chunks = [...codeChunks, ...chunk(uiScope, CHUNK_CHARS)];
-  const lensOf = (i) => i < codeChunks.length ? "code" : "ui";
-  log2(`find: ${changed.length} of ${diffs.length} files in ${codeChunks.length} parts${ui ? `, ${uiScope.length} UI files in ${chunks.length - codeChunks.length} parts` : ""}`);
+  const chunks = findParts(input2.scope, ui?.paths);
+  const count2 = (lens) => chunks.filter((c) => c.lens === lens).length;
+  log2(`find: ${changed.length} of ${diffs.length} files in ${count2("code")} parts${ui ? `, plus ${count2("ui")} UI parts` : ""}`);
   const findStart = Date.now();
-  const parts = await pool(chunks, FIND_AGENTS, async (part, i) => {
-    const lens = lensOf(i);
+  const parts = await pool(chunks, FIND_AGENTS, async ({ files: part, lens }, i) => {
     const mine = part.filter((d) => d.status !== "deleted").map((d) => d.path);
     const user = [
       `PR title: ${input2.pr.title}`,
@@ -16951,10 +16956,11 @@ ${d.numbered}`;
     });
   });
   const findMs = Date.now() - findStart;
-  const failedParts = parts.filter((p) => p === void 0).length;
-  const reviewed = codeChunks.flatMap((part, i) => {
+  const failed = { code: 0, ui: 0 };
+  chunks.forEach((c, i) => parts[i] === void 0 && (failed[c.lens] += 1));
+  const reviewed = chunks.flatMap(({ files, lens }, i) => {
     const p = parts[i];
-    return p ? part.filter((d) => p.checked.has(d.path)).map((d) => d.path) : [];
+    return p && lens === "code" ? files.filter((d) => p.checked.has(d.path)).map((d) => d.path) : [];
   });
   const ruleIds = new Set(input2.rules.map((r) => r.id));
   const candidates = parts.flatMap((p) => p?.findings ?? []);
@@ -17009,7 +17015,7 @@ ${patchOf(finding.file)}`
     if (verdict) log2(`verify ${verdict.verdict}: ${finding.file}:${finding.line} ${finding.title} (${verdict.reason.slice(0, 160)})`);
     return { finding, ...verdict ? { verdict } : {}, ...prev ? { previous: prev } : {} };
   });
-  return { checked, candidates: found.length, verified: jobs.length, failedParts, parts: chunks.length, reviewed, findMs, verifyMs: Date.now() - verifyStart };
+  return { checked, candidates: found.length, verified: jobs.length, failed, parts: chunks.length, reviewed, findMs, verifyMs: Date.now() - verifyStart };
 }
 var Groups = type({ duplicates: "string[][]" });
 async function dedupe(llm, root, findings, known, log2) {
@@ -17073,7 +17079,7 @@ var CODE = /\.(tsx?|jsx?|vue|svelte|css|scss)$/;
 var TEST = /(^|\/)__tests__\/|\.(test|spec|stories)\.\w+$/;
 function exportsOf(text) {
   const names = [...text.matchAll(/^export\s+(?:default\s+)?(?:async\s+)?(?:function|const|let|class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/gm)].map((m) => m[1] ?? "");
-  const lists = [...text.matchAll(/^export\s*\{([^}]*)\}/gm)].flatMap(
+  const lists = [...text.matchAll(/^export\s*(?:type\s*)?\{([^}]*)\}/gm)].flatMap(
     (m) => (m[1] ?? "").split(",").map((part) => part.trim().replace(/^type\s+/, "").split(/\s+as\s+/).pop()?.trim() ?? "")
   );
   const vars = [...text.matchAll(/^\s*(--[\w-]+)\s*:/gm)].map((m) => m[1] ?? "");
@@ -17103,7 +17109,7 @@ async function uiCatalog(root, ref, ui) {
 ${await readAt(root, ref, f) ?? ""}`)
     ).then((parts) => parts.join("\n").slice(0, BUDGET.docs))
   ]);
-  return [
+  const catalog = [
     components && `Shared components (path: exports):
 ${components}`,
     tokens2 && `Design tokens (path: exports):
@@ -17111,6 +17117,12 @@ ${tokens2}`,
     docs && `UI docs:
 ${docs}`
   ].filter(Boolean).join("\n\n");
+  const empty = [
+    ui.components.length && !components ? "ui.components" : "",
+    ui.tokens.length && !tokens2 ? "ui.tokens" : "",
+    ui.docs.length && !docs ? "ui.docs" : ""
+  ].filter(Boolean);
+  return { catalog, empty };
 }
 
 // src/github.ts
@@ -17503,15 +17515,23 @@ async function main() {
     if (id === void 0) return;
     await gh.updateCheck(id, { status: "completed", completed_at: (/* @__PURE__ */ new Date()).toISOString(), ...body }).then(() => void 0, (e) => log.warn(`Could not finish the ReviewPilot check: ${String(e).slice(0, 200)}`));
   };
+  let uiCheckDue = false;
+  const postUiCheck = async (body) => {
+    if (!uiCheckDue) return;
+    uiCheckDue = false;
+    const done = { status: "completed", completed_at: (/* @__PURE__ */ new Date()).toISOString() };
+    await gh.createCheck(pr.head.sha, { ...done, ...body }, "ReviewPilot UI").catch(() => body.output && gh.createCheck(pr.head.sha, { ...done, ...body, output: { ...body.output, annotations: [] } }, "ReviewPilot UI")).catch((e) => log.warn(`Could not post the ReviewPilot UI check: ${String(e).slice(0, 200)}`));
+  };
   let restoring;
   let stateSaved = false;
   const restoreSummary = (what) => restoring ??= putBackSummary(what);
   const putBackSummary = async (what) => {
     if (dryRun || summaryId === void 0 || stateSaved) return;
-    await finishCheck({
+    const ended = {
       conclusion: what === "stopped" ? "cancelled" : "neutral",
       output: { title: what === "stopped" ? "Stopped" : "Review failed", summary: what === "stopped" ? "A newer push or the time limit stopped this review." : "The review failed. Comment `/review` to retry." }
-    });
+    };
+    await Promise.all([finishCheck(ended), postUiCheck(ended)]);
     const runUrl = `${process.env.GITHUB_SERVER_URL ?? "https://github.com"}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}`;
     const restore = existing?.id === summaryId && !existing.body.startsWith(PROGRESS) ? existing.body : void 0;
     const why = what === "stopped" ? "A newer push or the time limit stopped it." : process.env.GITHUB_RUN_ID ? `See the [workflow run](${runUrl}).` : "See the ReviewPilot server logs.";
@@ -17539,6 +17559,7 @@ ${writeState(prev)}` : ""}`;
       return { mergeBase: mergeBase2, defaultRef: defaultRef2, ...loadConfig(await readAt(root, defaultRef2, ".reviewpilot.yml")) };
     });
     if (warning) log.warn(warning);
+    uiCheckDue = !dryRun && config.ui !== void 0;
     const model = input("model") ?? config.model.name;
     const verifyModel = input("verify_model") ?? config.model.verify;
     const baseUrl = input("base_url") ?? process.env.REVIEWPILOT_BASE_URL ?? "https://api.commandcode.ai/provider/v1";
@@ -17561,10 +17582,10 @@ ${text}` : "";
           log.warn(`Could not read review threads, so dismissals and closing are skipped this run: ${String(e)}`);
           return [];
         }),
-        config.ui ? uiCatalog(root, defaultRef, config.ui) : ""
+        config.ui ? uiCatalog(root, defaultRef, config.ui) : { catalog: "", empty: [] }
       ]);
       log.line(`${diffs2.length} files, ${size.toLocaleString("en")} characters of diff, ${threads2.length} review threads`);
-      if (config.ui) log.line(`UI lens on, catalog ${catalog2.length.toLocaleString("en")} characters`);
+      if (config.ui) log.line(`UI lens on, catalog ${catalog2.catalog.length.toLocaleString("en")} characters`);
       return { diffs: diffs2, skipped: reviewable.length - diffs2.length, guidance: guidance2, threads: threads2, catalog: catalog2, touched: new Set(all.map((d) => d.path)) };
     });
     const threadOf = (f) => threads.find(
@@ -17598,7 +17619,7 @@ ${text}` : "";
     const { scope: scope2, fresh: freshLines, changed } = focus(diffs, seen, since);
     const limits = { diffs, scope: scope2, fresh: freshLines, incremental: seen !== void 0, outside: config.review.outside_diff };
     const followUp = !comment && prev !== void 0;
-    const { checked, candidates, verified, failedParts, parts, reviewed, findMs, verifyMs } = await log.phase(
+    const { checked, candidates, verified, failed, parts, reviewed, findMs, verifyMs } = await log.phase(
       "Review",
       () => review({
         find,
@@ -17614,7 +17635,7 @@ ${text}` : "";
         limits,
         followUp,
         changed,
-        ...config.ui ? { ui: { paths: config.ui.paths, catalog } } : {},
+        ...config.ui ? { ui: { paths: config.ui.paths, catalog: catalog.catalog } } : {},
         replies,
         log: log.line
       })
@@ -17696,7 +17717,8 @@ ${text}` : "";
       warning,
       skipped > 0 ? `${skipped} files did not fit in the review budget and were not reviewed.` : "",
       overCap > 0 ? `${overCap} more confirmed findings were over max_findings (${config.review.max_findings}) and are not shown.` : "",
-      failedParts > 0 ? `${failedParts} of ${parts} parts of the diff could not be reviewed this run, so this review is partial. Comment \`/review\` to retry.` : ""
+      failed.code + failed.ui > 0 ? `${failed.code + failed.ui} of ${parts} parts of the diff could not be reviewed this run, so this review is partial. Comment \`/review\` to retry.` : "",
+      catalog.empty.length ? `The UI lens found nothing usable for ${catalog.empty.join(", ")}: check the globs, and that token files are code or CSS with exports.` : ""
     ].filter(Boolean).join(" ");
     const modelLabel = verifyModel === model ? model : `${model} (verify: ${verifyModel})`;
     const usage = verify === find ? find.usage : {
@@ -17768,17 +17790,15 @@ ${summaryBody(state, prev, outside, run2, config.review.pass_score, uiPass)}`);
         if (!resolved) unresolved += 1;
       });
       if (unresolved) log.line(`${unresolved} fixed threads collapsed but left unresolved: resolving needs Contents write on the token.`);
-      const unsettled = checked.some((c) => !c.verdict && !(c.previous && replies.has(c.previous.fp)));
-      const partial = failedParts > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
+      const partial = (lens) => {
+        const unsettled = checked.some((c) => !c.verdict && lensOf(c.finding) === lens && !(c.previous && replies.has(c.previous.fp)));
+        return failed[lens] > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
+      };
       const summaryUrl = `https://github.com/${repo}/pull/${number2}#issuecomment-${summaryId}`;
-      const result = checkResult(lensView(state, "code"), run2, summaryUrl, partial, config.review.pass_score);
+      const result = checkResult(lensView(state, "code"), run2, summaryUrl, partial("code"), config.review.pass_score);
       const finished = checkId !== void 0 && await gh.updateCheck(checkId, { status: "completed", completed_at: (/* @__PURE__ */ new Date()).toISOString(), ...result }).then(() => true, () => false);
       if (checkId !== void 0 && !finished && result.output) await finishCheck({ ...result, output: { ...result.output, annotations: [] } });
-      if (checkId !== void 0 && uiPass !== void 0) {
-        const ui = checkResult(lensView(state, "ui"), run2, summaryUrl, partial, uiPass);
-        const done = { status: "completed", completed_at: (/* @__PURE__ */ new Date()).toISOString() };
-        await gh.createCheck(pr.head.sha, { ...done, ...ui }, "ReviewPilot UI").catch(() => ui.output && gh.createCheck(pr.head.sha, { ...done, ...ui, output: { ...ui.output, annotations: [] } }, "ReviewPilot UI")).catch((e) => log.warn(`Could not post the ReviewPilot UI check: ${String(e).slice(0, 200)}`));
-      }
+      if (uiPass !== void 0) await postUiCheck(checkResult(lensView(state, "ui"), run2, summaryUrl, partial("ui"), uiPass));
     });
     await log.report({
       score: state.score,
@@ -17790,7 +17810,8 @@ ${summaryBody(state, prev, outside, run2, config.review.pass_score, uiPass)}`);
     });
   } catch (e) {
     if (stateSaved) {
-      await finishCheck({ conclusion: "neutral", output: { title: "Posted, then a later step failed", summary: "The review and its summary are posted. A later step failed; see the logs." } });
+      const later = { conclusion: "neutral", output: { title: "Posted, then a later step failed", summary: "The review and its summary are posted. A later step failed; see the logs." } };
+      await Promise.all([finishCheck(later), postUiCheck(later)]);
     } else {
       await restoreSummary("failed");
     }

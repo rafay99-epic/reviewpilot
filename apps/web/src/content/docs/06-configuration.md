@@ -96,7 +96,7 @@ ui:
 | `rules[].paths` | glob list | every file | The rule applies when a changed file matches |
 | `ui.paths` | glob list | required to turn the UI lens on | Changed files the UI lens reviews |
 | `ui.components` | glob list | none | Shared component files. Their exports, read from the default branch, form the catalog the lens checks against |
-| `ui.tokens` | glob list | none | Theme and token files: colors, spacing, radii, type scale. CSS custom properties count |
+| `ui.tokens` | glob list | none | Theme and token files: colors, spacing, radii, type scale. Code or CSS files: their exports and CSS custom properties are listed. A key that matches nothing usable is named in the summary |
 | `ui.docs` | path or glob list | none | Markdown with your UI rules, under any name. Up to 4,000 characters in total |
 | `ui.pass_score` | 1 to 5 | `5` | The score at which the separate **ReviewPilot UI** check passes |
 

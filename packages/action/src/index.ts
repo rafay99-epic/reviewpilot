@@ -17,6 +17,8 @@ import {
   FINDING_TAG,
   fingerprint,
   lastMarker,
+  type Lens,
+  lensOf,
   lensView,
   postedOnHead,
   readState,
@@ -133,6 +135,18 @@ async function main() {
     await gh.updateCheck(id, { status: "completed", completed_at: new Date().toISOString(), ...body })
       .then(() => undefined, (e: unknown) => log.warn(`Could not finish the ReviewPilot check: ${String(e).slice(0, 200)}`));
   };
+  // The ReviewPilot UI check is posted once, already complete, on every way a run ends once
+  // the repo's config turns the UI lens on: a required check must never wait forever.
+  let uiCheckDue = false;
+  const postUiCheck = async (body: CheckUpdate) => {
+    if (!uiCheckDue) return;
+    uiCheckDue = false;
+    const done = { status: "completed" as const, completed_at: new Date().toISOString() };
+    // One bad annotation fails the whole create, so a second try goes without them.
+    await gh.createCheck(pr.head.sha, { ...done, ...body }, "ReviewPilot UI")
+      .catch(() => body.output && gh.createCheck(pr.head.sha, { ...done, ...body, output: { ...body.output, annotations: [] } }, "ReviewPilot UI"))
+      .catch((e: unknown) => log.warn(`Could not post the ReviewPilot UI check: ${String(e).slice(0, 200)}`));
+  };
 
   // Puts the previous summary back so a failed or stopped run never wipes the PR's history;
   // on a first run, says what happened instead of leaving "reviewing..." up. Runs once, even
@@ -142,10 +156,11 @@ async function main() {
   const restoreSummary = (what: "failed" | "stopped") => (restoring ??= putBackSummary(what));
   const putBackSummary = async (what: "failed" | "stopped") => {
     if (dryRun || summaryId === undefined || stateSaved) return;
-    await finishCheck({
+    const ended: CheckUpdate = {
       conclusion: what === "stopped" ? "cancelled" : "neutral",
       output: { title: what === "stopped" ? "Stopped" : "Review failed", summary: what === "stopped" ? "A newer push or the time limit stopped this review." : "The review failed. Comment `/review` to retry." },
-    });
+    };
+    await Promise.all([finishCheck(ended), postUiCheck(ended)]);
     const runUrl = `${process.env.GITHUB_SERVER_URL ?? "https://github.com"}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}`;
     // A "reviewing" summary left by a killed run is not worth restoring: it would claim a
     // review that is not running. The stopped or failed note below carries the same state.
@@ -180,6 +195,7 @@ async function main() {
       return { mergeBase, defaultRef, ...loadConfig(await readAt(root, defaultRef, ".reviewpilot.yml")) };
     });
     if (warning) log.warn(warning);
+    uiCheckDue = !dryRun && config.ui !== undefined;
     const model = input("model") ?? config.model.name;
     const verifyModel = input("verify_model") ?? config.model.verify;
     const baseUrl = input("base_url") ?? process.env.REVIEWPILOT_BASE_URL ?? "https://api.commandcode.ai/provider/v1";
@@ -204,10 +220,10 @@ async function main() {
           log.warn(`Could not read review threads, so dismissals and closing are skipped this run: ${String(e)}`);
           return [];
         }),
-        config.ui ? uiCatalog(root, defaultRef, config.ui) : "",
+        config.ui ? uiCatalog(root, defaultRef, config.ui) : { catalog: "", empty: [] },
       ]);
       log.line(`${diffs.length} files, ${size.toLocaleString("en")} characters of diff, ${threads.length} review threads`);
-      if (config.ui) log.line(`UI lens on, catalog ${catalog.length.toLocaleString("en")} characters`);
+      if (config.ui) log.line(`UI lens on, catalog ${catalog.catalog.length.toLocaleString("en")} characters`);
       return { diffs, skipped: reviewable.length - diffs.length, guidance, threads, catalog, touched: new Set(all.map((d) => d.path)) };
     });
 
@@ -262,7 +278,7 @@ async function main() {
     const limits: Limits = { diffs, scope, fresh: freshLines, incremental: seen !== undefined, outside: config.review.outside_diff };
     // Any push after an earlier review, whatever review.scope says; `/review` is a full review.
     const followUp = !comment && prev !== undefined;
-    const { checked, candidates, verified, failedParts, parts, reviewed, findMs, verifyMs } = await log.phase("Review", () =>
+    const { checked, candidates, verified, failed, parts, reviewed, findMs, verifyMs } = await log.phase("Review", () =>
       review({
         find,
         verify,
@@ -277,7 +293,7 @@ async function main() {
         limits,
         followUp,
         changed,
-        ...(config.ui ? { ui: { paths: config.ui.paths, catalog } } : {}),
+        ...(config.ui ? { ui: { paths: config.ui.paths, catalog: catalog.catalog } } : {}),
         replies,
         log: log.line,
       }),
@@ -386,7 +402,8 @@ async function main() {
       warning,
       skipped > 0 ? `${skipped} files did not fit in the review budget and were not reviewed.` : "",
       overCap > 0 ? `${overCap} more confirmed findings were over max_findings (${config.review.max_findings}) and are not shown.` : "",
-      failedParts > 0 ? `${failedParts} of ${parts} parts of the diff could not be reviewed this run, so this review is partial. Comment \`/review\` to retry.` : "",
+      failed.code + failed.ui > 0 ? `${failed.code + failed.ui} of ${parts} parts of the diff could not be reviewed this run, so this review is partial. Comment \`/review\` to retry.` : "",
+      catalog.empty.length ? `The UI lens found nothing usable for ${catalog.empty.join(", ")}: check the globs, and that token files are code or CSS with exports.` : "",
     ].filter(Boolean).join(" ");
     const modelLabel = verifyModel === model ? model : `${model} (verify: ${verifyModel})`;
     const usage = verify === find
@@ -470,22 +487,19 @@ async function main() {
       if (unresolved) log.line(`${unresolved} fixed threads collapsed but left unresolved: resolving needs Contents write on the token.`);
 
       // Files skipped, parts that failed, or candidates whose check failed: not a full review.
+      // Judged per lens, so a UI agent that failed never fails the code check, or the reverse.
       // A replied-to finding whose re-check failed is still settled (dismissed on the reply).
-      const unsettled = checked.some((c) => !c.verdict && !(c.previous && replies.has(c.previous.fp)));
-      const partial = failedParts > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
+      const partial = (lens: Lens) => {
+        const unsettled = checked.some((c) => !c.verdict && lensOf(c.finding) === lens && !(c.previous && replies.has(c.previous.fp)));
+        return failed[lens] > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
+      };
       const summaryUrl = `https://github.com/${repo}/pull/${number}#issuecomment-${summaryId}`;
-      const result = checkResult(lensView(state, "code"), run, summaryUrl, partial, config.review.pass_score);
+      const result = checkResult(lensView(state, "code"), run, summaryUrl, partial("code"), config.review.pass_score);
       // One bad annotation fails the whole update; the check must not stay "in progress".
       const finished = checkId !== undefined && (await gh.updateCheck(checkId, { status: "completed", completed_at: new Date().toISOString(), ...result }).then(() => true, () => false));
       if (checkId !== undefined && !finished && result.output) await finishCheck({ ...result, output: { ...result.output, annotations: [] } });
-      // The UI lens gets its own check, posted complete, so a design nit and a bug gate apart.
-      if (checkId !== undefined && uiPass !== undefined) {
-        const ui = checkResult(lensView(state, "ui"), run, summaryUrl, partial, uiPass);
-        const done = { status: "completed" as const, completed_at: new Date().toISOString() };
-        await gh.createCheck(pr.head.sha, { ...done, ...ui }, "ReviewPilot UI")
-          .catch(() => ui.output && gh.createCheck(pr.head.sha, { ...done, ...ui, output: { ...ui.output, annotations: [] } }, "ReviewPilot UI"))
-          .catch((e: unknown) => log.warn(`Could not post the ReviewPilot UI check: ${String(e).slice(0, 200)}`));
-      }
+      // The UI lens gets its own check, so a design nit and a bug gate apart.
+      if (uiPass !== undefined) await postUiCheck(checkResult(lensView(state, "ui"), run, summaryUrl, partial("ui"), uiPass));
     });
 
     await log.report({
@@ -499,7 +513,8 @@ async function main() {
   } catch (e) {
     // After the new summary is saved, the review is posted: only the check says a later step failed.
     if (stateSaved) {
-      await finishCheck({ conclusion: "neutral", output: { title: "Posted, then a later step failed", summary: "The review and its summary are posted. A later step failed; see the logs." } });
+      const later: CheckUpdate = { conclusion: "neutral", output: { title: "Posted, then a later step failed", summary: "The review and its summary are posted. A later step failed; see the logs." } };
+      await Promise.all([finishCheck(later), postUiCheck(later)]);
     } else {
       await restoreSummary("failed");
     }

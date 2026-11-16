@@ -16,7 +16,7 @@ const TEST = /(^|\/)__tests__\/|\.(test|spec|stories)\.\w+$/;
 /** Exported names in a source file: components, hooks, tokens, prop types. */
 export function exportsOf(text: string): string[] {
   const names = [...text.matchAll(/^export\s+(?:default\s+)?(?:async\s+)?(?:function|const|let|class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/gm)].map((m) => m[1] ?? "");
-  const lists = [...text.matchAll(/^export\s*\{([^}]*)\}/gm)].flatMap((m) =>
+  const lists = [...text.matchAll(/^export\s*(?:type\s*)?\{([^}]*)\}/gm)].flatMap((m) =>
     (m[1] ?? "").split(",").map((part) => part.trim().replace(/^type\s+/, "").split(/\s+as\s+/).pop()?.trim() ?? ""),
   );
   // CSS custom properties count as tokens.
@@ -42,7 +42,11 @@ async function section(root: string, ref: string, all: readonly string[], globs:
   return fit(lines.filter(Boolean), budget);
 }
 
-export async function uiCatalog(root: string, ref: string, ui: UiConfig): Promise<string> {
+/**
+ * The catalog text, and which configured `ui` keys matched nothing usable (a typo in a glob,
+ * or token files with no exports the catalog can read), so the run can say so.
+ */
+export async function uiCatalog(root: string, ref: string, ui: UiConfig): Promise<{ catalog: string; empty: string[] }> {
   const all = await filesAt(root, ref);
   const [components, tokens, docs] = await Promise.all([
     section(root, ref, all, ui.components, BUDGET.components),
@@ -53,9 +57,15 @@ export async function uiCatalog(root: string, ref: string, ui: UiConfig): Promis
         .map(async (f) => `--- ${f} ---\n${(await readAt(root, ref, f)) ?? ""}`),
     ).then((parts) => parts.join("\n").slice(0, BUDGET.docs)),
   ]);
-  return [
+  const catalog = [
     components && `Shared components (path: exports):\n${components}`,
     tokens && `Design tokens (path: exports):\n${tokens}`,
     docs && `UI docs:\n${docs}`,
   ].filter(Boolean).join("\n\n");
+  const empty = [
+    ui.components.length && !components ? "ui.components" : "",
+    ui.tokens.length && !tokens ? "ui.tokens" : "",
+    ui.docs.length && !docs ? "ui.docs" : "",
+  ].filter(Boolean);
+  return { catalog, empty };
 }

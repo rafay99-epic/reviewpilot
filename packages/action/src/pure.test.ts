@@ -3,9 +3,9 @@ import { test } from "node:test";
 import { DEFAULTS, ignored, loadConfig, rulesFor } from "./config.ts";
 import { anchor, type FileDiff, parseDiff, unquote } from "./diff.ts";
 import { blockers, checkResult, clean, summaryBody } from "./render.ts";
-import { answerReply, chunk, focus, inFile, type Limits, newFindingRank, nextFiles, ranges, reportable, settle, stale, submitFindings } from "./review.ts";
+import { answerReply, chunk, focus, inFile, type Limits, newFindingRank, nextFiles, ranges, reportable, settle, stale, findParts, submitFindings } from "./review.ts";
 import { exportsOf, fit } from "./catalog.ts";
-import { diffHash, findingTag, fingerprint, lensView, postedOnHead, readState, score, STATE_BUDGET, writeState } from "./state.ts";
+import { diffHash, findingTag, fingerprint, lensView, postedOnHead, sameIssue, readState, score, STATE_BUDGET, writeState } from "./state.ts";
 
 const DIFF = `diff --git a/src/a.ts b/src/a.ts
 index 1..2 100644
@@ -341,6 +341,7 @@ test("the check passes only at 5/5 and annotates each open finding", () => {
 test("the UI catalog lists a file's exported components, re-exports and CSS tokens", () => {
   const src = `export function Button() {}\nexport const Card = () => null;\nexport type ButtonProps = {};\nexport { Sheet as BottomSheet, Row };\nexport default Button;\nconst local = 1;`;
   assert.deepEqual(exportsOf(src), ["Button", "Card", "ButtonProps", "BottomSheet", "Row"]);
+  assert.deepEqual(exportsOf("export type { Palette, Scheme as ColorScheme } from './tokens';"), ["Palette", "ColorScheme"]);
   assert.deepEqual(exportsOf(":root {\n  --space-2: 8px;\n  --brand: #000;\n}"), ["--space-2", "--brand"]);
 });
 
@@ -369,4 +370,19 @@ test("code and UI findings score apart and show side by side in the summary", ()
 test("catalog sections keep whole lines within their budget and say what was left out", () => {
   assert.equal(fit(["- a", "- b"], 100), "- a\n- b");
   assert.equal(fit(["- aaaa", "- bbbb", "- cccc"], 14), "- aaaa\n- bbbb\n(1 more files not listed; search the repository for them)");
+});
+
+test("find parts: code covers every file, UI parts only the UI files, each tagged with its lens", () => {
+  const file = (path: string) => ({ ...parseDiff(DIFF)[0], path }) as FileDiff;
+  const scope = [file("src/a.ts"), file("app/Screen.tsx")];
+  assert.deepEqual(findParts(scope, undefined).map((p) => [p.lens, p.files.map((f) => f.path)]), [["code", ["src/a.ts", "app/Screen.tsx"]]]);
+  assert.deepEqual(findParts(scope, ["app/**/*.tsx"]).map((p) => [p.lens, p.files.map((f) => f.path)]), [
+    ["code", ["src/a.ts", "app/Screen.tsx"]],
+    ["ui", ["app/Screen.tsx"]],
+  ]);
+});
+
+test("a UI finding next to a code finding is a different finding", () => {
+  assert.equal(sameIssue({ file: "a.tsx", line: 10 }, { file: "a.tsx", line: 11 }), true);
+  assert.equal(sameIssue({ file: "a.tsx", line: 10 }, { file: "a.tsx", line: 11, lens: "ui" }), false);
 });
