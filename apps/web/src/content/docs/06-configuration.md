@@ -63,6 +63,14 @@ rules:
     severity: major
     paths: ["apps/**", "packages/**"]
     rule: No `any` or unchecked casts. Server types flow to the client without being redeclared.
+
+# Optional: a second reviewer that checks UI code against your own design system.
+ui:
+  paths: ["apps/mobile/src/**/*.tsx"]          # files the UI lens reviews
+  components: ["apps/mobile/src/ui/**"]        # shared components; their exports form the catalog
+  tokens: ["apps/mobile/src/theme/**"]         # colors, spacing, type scale
+  docs: ["DESIGN.md", "docs/ui-consistency.md"] # UI rules, any markdown file name
+  pass_score: 5                                # the ReviewPilot UI check passes at this score
 ```
 
 ## Keys
@@ -86,6 +94,17 @@ rules:
 | `rules[].rule` | string | required | What must hold, in one or two sentences |
 | `rules[].severity` | `minor` `major` `critical` | `major` | |
 | `rules[].paths` | glob list | every file | The rule applies when a changed file matches |
+| `ui.paths` | glob list | required to turn the UI lens on | Changed files the UI lens reviews |
+| `ui.components` | glob list | none | Shared component files. Their exports, read from the default branch, form the catalog the lens checks against |
+| `ui.tokens` | glob list | none | Theme and token files: colors, spacing, radii, type scale. Code or CSS files: their exports and CSS custom properties are listed. A key that matches nothing usable is named in the summary |
+| `ui.docs` | path or glob list | none | Markdown with your UI rules, under any name. Up to 4,000 characters in total |
+| `ui.pass_score` | 1 to 5 | `5` | The score at which the separate **ReviewPilot UI** check passes |
+
+## UI lens
+
+With `ui` set, a second set of agents reviews the files under `ui.paths` for consistency with your design system, not for bugs. It looks for a new component that duplicates a shared one, raw primitives where a shared component exists, hard-coded colors or spacing where a token exists, a screen that skips the layout its siblings use, and anything your UI docs forbid or require. The verifier rejects a finding when the shared component cannot do what the new code needs, or when the codebase is itself split on the pattern.
+
+UI findings are tagged **UI** inline and in the summary, score on their own (`ReviewPilot: 5/5 · UI 4/5`) and get a separate **ReviewPilot UI** check. Require it in a branch ruleset only if design drift should block merges. Remove `ui` and its open findings are dismissed.
 
 ## Action inputs
 

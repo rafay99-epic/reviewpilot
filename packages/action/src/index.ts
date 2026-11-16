@@ -6,6 +6,7 @@ import { readFile } from "node:fs/promises";
 import { type } from "arktype";
 import { ignored, loadConfig, rulesFor } from "./config.ts";
 import { anchor, parseDiff } from "./diff.ts";
+import { uiCatalog } from "./catalog.ts";
 import { changedSince, checkoutPr, diff, fetchRef, readAt } from "./git.ts";
 import { type CheckUpdate, createGitHub, type InlineComment, type Thread } from "./github.ts";
 import { createLlm } from "./llm.ts";
@@ -16,6 +17,9 @@ import {
   FINDING_TAG,
   fingerprint,
   lastMarker,
+  type Lens,
+  lensOf,
+  lensView,
   postedOnHead,
   readState,
   sameIssue,
@@ -131,6 +135,18 @@ async function main() {
     await gh.updateCheck(id, { status: "completed", completed_at: new Date().toISOString(), ...body })
       .then(() => undefined, (e: unknown) => log.warn(`Could not finish the ReviewPilot check: ${String(e).slice(0, 200)}`));
   };
+  // The ReviewPilot UI check is posted once, already complete, on every way a run ends once
+  // the repo's config turns the UI lens on: a required check must never wait forever.
+  let uiCheckDue = false;
+  const postUiCheck = async (body: CheckUpdate) => {
+    if (!uiCheckDue) return;
+    uiCheckDue = false;
+    const done = { status: "completed" as const, completed_at: new Date().toISOString() };
+    // One bad annotation fails the whole create, so a second try goes without them.
+    await gh.createCheck(pr.head.sha, { ...done, ...body }, "ReviewPilot UI")
+      .catch(() => body.output && gh.createCheck(pr.head.sha, { ...done, ...body, output: { ...body.output, annotations: [] } }, "ReviewPilot UI"))
+      .catch((e: unknown) => log.warn(`Could not post the ReviewPilot UI check: ${String(e).slice(0, 200)}`));
+  };
 
   // Puts the previous summary back so a failed or stopped run never wipes the PR's history;
   // on a first run, says what happened instead of leaving "reviewing..." up. Runs once, even
@@ -140,10 +156,11 @@ async function main() {
   const restoreSummary = (what: "failed" | "stopped") => (restoring ??= putBackSummary(what));
   const putBackSummary = async (what: "failed" | "stopped") => {
     if (dryRun || summaryId === undefined || stateSaved) return;
-    await finishCheck({
+    const ended: CheckUpdate = {
       conclusion: what === "stopped" ? "cancelled" : "neutral",
       output: { title: what === "stopped" ? "Stopped" : "Review failed", summary: what === "stopped" ? "A newer push or the time limit stopped this review." : "The review failed. Comment `/review` to retry." },
-    });
+    };
+    await Promise.all([finishCheck(ended), postUiCheck(ended)]);
     const runUrl = `${process.env.GITHUB_SERVER_URL ?? "https://github.com"}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}`;
     // A "reviewing" summary left by a killed run is not worth restoring: it would claim a
     // review that is not running. The stopped or failed note below carries the same state.
@@ -178,11 +195,12 @@ async function main() {
       return { mergeBase, defaultRef, ...loadConfig(await readAt(root, defaultRef, ".reviewpilot.yml")) };
     });
     if (warning) log.warn(warning);
+    uiCheckDue = !dryRun && config.ui !== undefined;
     const model = input("model") ?? config.model.name;
     const verifyModel = input("verify_model") ?? config.model.verify;
     const baseUrl = input("base_url") ?? process.env.REVIEWPILOT_BASE_URL ?? "https://api.commandcode.ai/provider/v1";
 
-    const { diffs, skipped, guidance, threads, touched } = await log.phase("Diff and context", async () => {
+    const { diffs, skipped, guidance, threads, catalog, touched } = await log.phase("Diff and context", async () => {
       const all = parseDiff(await diff(root, mergeBase, pr.head.sha, config.review.ignore));
       // Files without hunks (binary, mode-only changes) have nothing to review.
       const reviewable = all.filter((d) => !ignored(config, d.path) && d.commentable.size > 0);
@@ -193,7 +211,7 @@ async function main() {
         size += d.numbered.length;
         return true;
       });
-      const [guidance, threads] = await Promise.all([
+      const [guidance, threads, catalog] = await Promise.all([
         Promise.all(config.context_files.map(async (f) => {
           const text = await readAt(root, defaultRef, f);
           return text ? `--- ${f} ---\n${text}` : "";
@@ -202,9 +220,11 @@ async function main() {
           log.warn(`Could not read review threads, so dismissals and closing are skipped this run: ${String(e)}`);
           return [];
         }),
+        config.ui ? uiCatalog(root, defaultRef, config.ui) : { catalog: "", empty: [] },
       ]);
       log.line(`${diffs.length} files, ${size.toLocaleString("en")} characters of diff, ${threads.length} review threads`);
-      return { diffs, skipped: reviewable.length - diffs.length, guidance, threads, touched: new Set(all.map((d) => d.path)) };
+      if (config.ui) log.line(`UI lens on, catalog ${catalog.catalog.length.toLocaleString("en")} characters`);
+      return { diffs, skipped: reviewable.length - diffs.length, guidance, threads, catalog, touched: new Set(all.map((d) => d.path)) };
     });
 
     // A finding's thread is the one whose first comment is the finding's own inline comment.
@@ -231,7 +251,8 @@ async function main() {
       }
       const t = threadOf(p);
       const resolved = t?.resolved && !ours(t.resolvedBy);
-      if (resolved || SEVERITIES.indexOf(p.severity) > minRank) {
+      // A UI finding outlives the repo's `ui` config only as dismissed.
+      if (resolved || SEVERITIES.indexOf(p.severity) > minRank || (p.lens === "ui" && !config.ui)) {
         p.status = "dismissed";
         continue;
       }
@@ -257,7 +278,7 @@ async function main() {
     const limits: Limits = { diffs, scope, fresh: freshLines, incremental: seen !== undefined, outside: config.review.outside_diff };
     // Any push after an earlier review, whatever review.scope says; `/review` is a full review.
     const followUp = !comment && prev !== undefined;
-    const { checked, candidates, verified, failedParts, parts, reviewed, findMs, verifyMs } = await log.phase("Review", () =>
+    const { checked, candidates, verified, failed, parts, reviewed, findMs, verifyMs } = await log.phase("Review", () =>
       review({
         find,
         verify,
@@ -272,6 +293,7 @@ async function main() {
         limits,
         followUp,
         changed,
+        ...(config.ui ? { ui: { paths: config.ui.paths, catalog: catalog.catalog } } : {}),
         replies,
         log: log.line,
       }),
@@ -338,7 +360,14 @@ async function main() {
 
     const open = findings.filter((f) => f.status === "open");
     const files = nextFiles(diffs, scope, reviewed);
-    const state: State = { head: pr.head.sha, score: score(open), findings, files };
+    const state: State = {
+      head: pr.head.sha,
+      score: score(open.filter((f) => f.lens !== "ui")),
+      ...(config.ui ? { uiScore: score(open.filter((f) => f.lens === "ui")) } : {}),
+      findings,
+      files,
+    };
+    const uiPass = config.ui?.pass_score;
 
     // A run stopped mid-post (deploy, kill) may have posted some of these on this head
     // already: they keep that comment instead of getting a second one.
@@ -373,7 +402,8 @@ async function main() {
       warning,
       skipped > 0 ? `${skipped} files did not fit in the review budget and were not reviewed.` : "",
       overCap > 0 ? `${overCap} more confirmed findings were over max_findings (${config.review.max_findings}) and are not shown.` : "",
-      failedParts > 0 ? `${failedParts} of ${parts} parts of the diff could not be reviewed this run, so this review is partial. Comment \`/review\` to retry.` : "",
+      failed.code + failed.ui > 0 ? `${failed.code + failed.ui} of ${parts} parts of the diff could not be reviewed this run, so this review is partial. Comment \`/review\` to retry.` : "",
+      catalog.empty.length ? `The UI lens found nothing usable for ${catalog.empty.join(", ")}: check the globs, and that token files are code or CSS with exports.` : "",
     ].filter(Boolean).join(" ");
     const modelLabel = verifyModel === model ? model : `${model} (verify: ${verifyModel})`;
     const usage = verify === find
@@ -398,11 +428,11 @@ async function main() {
       tokens: { prompt: usage.prompt, cached: usage.cached },
       ...(warningText ? { warning: warningText } : {}),
     };
-    log.line(`Score ${state.score}/5: ${fresh.length} new, ${open.length} open, ${fixedNow.length} fixed. ${usage.calls} model calls, ${usage.prompt.toLocaleString("en")} in (${usage.cached.toLocaleString("en")} cached) / ${usage.completion.toLocaleString("en")} out tokens.`);
+    log.line(`Score ${state.score}/5${state.uiScore ? `, UI ${state.uiScore}/5` : ""}: ${fresh.length} new, ${open.length} open, ${fixedNow.length} fixed. ${usage.calls} model calls, ${usage.prompt.toLocaleString("en")} in (${usage.cached.toLocaleString("en")} cached) / ${usage.completion.toLocaleString("en")} out tokens.`);
 
     if (dryRun) {
       for (const c of inline) log.line(`\n--- inline ${c.path}:${c.start_line ? `${c.start_line}-` : ""}${c.line}\n${c.body}`);
-      log.line(`\n--- summary\n${summaryBody(state, prev, outside, run, config.review.pass_score)}`);
+      log.line(`\n--- summary\n${summaryBody(state, prev, outside, run, config.review.pass_score, uiPass)}`);
       return;
     }
 
@@ -430,7 +460,7 @@ async function main() {
 
       // Save the new state right away. If the edit fails, a fresh summary beats losing the
       // state, which would make the next run post the same inline comments again.
-      const body = summaryBody(state, prev, outside, run, config.review.pass_score);
+      const body = summaryBody(state, prev, outside, run, config.review.pass_score, uiPass);
       const saved = summaryId !== undefined && (await gh.editComment(summaryId, body).then(() => true, () => false));
       if (!saved) summaryId = (await gh.comment(number, body)).id;
       stateSaved = true;
@@ -457,13 +487,19 @@ async function main() {
       if (unresolved) log.line(`${unresolved} fixed threads collapsed but left unresolved: resolving needs Contents write on the token.`);
 
       // Files skipped, parts that failed, or candidates whose check failed: not a full review.
+      // Judged per lens, so a UI agent that failed never fails the code check, or the reverse.
       // A replied-to finding whose re-check failed is still settled (dismissed on the reply).
-      const unsettled = checked.some((c) => !c.verdict && !(c.previous && replies.has(c.previous.fp)));
-      const partial = failedParts > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
-      const result = checkResult(state, run, `https://github.com/${repo}/pull/${number}#issuecomment-${summaryId}`, partial, config.review.pass_score);
+      const partial = (lens: Lens) => {
+        const unsettled = checked.some((c) => !c.verdict && lensOf(c.finding) === lens && !(c.previous && replies.has(c.previous.fp)));
+        return failed[lens] > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
+      };
+      const summaryUrl = `https://github.com/${repo}/pull/${number}#issuecomment-${summaryId}`;
+      const result = checkResult(lensView(state, "code"), run, summaryUrl, partial("code"), config.review.pass_score);
       // One bad annotation fails the whole update; the check must not stay "in progress".
       const finished = checkId !== undefined && (await gh.updateCheck(checkId, { status: "completed", completed_at: new Date().toISOString(), ...result }).then(() => true, () => false));
       if (checkId !== undefined && !finished && result.output) await finishCheck({ ...result, output: { ...result.output, annotations: [] } });
+      // The UI lens gets its own check, so a design nit and a bug gate apart.
+      if (uiPass !== undefined) await postUiCheck(checkResult(lensView(state, "ui"), run, summaryUrl, partial("ui"), uiPass));
     });
 
     await log.report({
@@ -477,7 +513,8 @@ async function main() {
   } catch (e) {
     // After the new summary is saved, the review is posted: only the check says a later step failed.
     if (stateSaved) {
-      await finishCheck({ conclusion: "neutral", output: { title: "Posted, then a later step failed", summary: "The review and its summary are posted. A later step failed; see the logs." } });
+      const later: CheckUpdate = { conclusion: "neutral", output: { title: "Posted, then a later step failed", summary: "The review and its summary are posted. A later step failed; see the logs." } };
+      await Promise.all([finishCheck(later), postUiCheck(later)]);
     } else {
       await restoreSummary("failed");
     }

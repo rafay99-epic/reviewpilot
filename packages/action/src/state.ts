@@ -19,6 +19,8 @@ const FindingSchema = type({
   /** Exact lines that prove the finding, as `file:line` with the code. */
   evidence: "string[]",
   "rule?": "string",
+  /** Set on findings from the UI lens; code findings carry none, so older state reads as code. */
+  "lens?": "'ui'",
 });
 
 const TrackedSchema = FindingSchema.and({
@@ -35,11 +37,16 @@ const TrackedSchema = FindingSchema.and({
 const StateSchema = type({
   head: "string",
   score: "1 | 2 | 3 | 4 | 5",
+  /** The UI lens's score, when the repo configures `ui`. `score` covers code findings only. */
+  "uiScore?": "1 | 2 | 3 | 4 | 5",
   findings: TrackedSchema.array(),
   "files?": "Record<string, string>",
 });
 
 export type Finding = typeof FindingSchema.infer;
+/** Which reviewer a finding came from. Stored only for UI findings (see `lens`). */
+export type Lens = "code" | "ui";
+export const lensOf = (f: Pick<Finding, "lens">): Lens => f.lens ?? "code";
 export type Tracked = typeof TrackedSchema.infer;
 export type State = typeof StateSchema.infer;
 export type Score = State["score"];
@@ -56,6 +63,15 @@ export function score(findings: readonly Pick<Finding, "severity">[]): Score {
   return findings.length > 0 ? 4 : 5;
 }
 
+/**
+ * The state as one lens sees it: its findings and its score. Render and the check work on a
+ * State, so each lens gets its own summary lines and check without a second code path.
+ */
+export function lensView(state: State, lens: Lens): State {
+  const findings = state.findings.filter((f) => lensOf(f) === lens);
+  return { ...state, findings, score: lens === "ui" ? (state.uiScore ?? 5) : state.score };
+}
+
 /** Stable id for a finding: same file and title is the same finding across runs. */
 export function fingerprint(f: Pick<Finding, "file" | "title">): string {
   const title = f.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -65,9 +81,12 @@ export function fingerprint(f: Pick<Finding, "file" | "title">): string {
 /** Hash of one file's PR diff: unchanged across pushes means nothing new to find in it. */
 export const diffHash = (numbered: string) => createHash("sha1").update(numbered).digest("hex").slice(0, 12);
 
-/** A new finding within two lines of an earlier one in the same file is treated as the same finding. */
-export function sameIssue(a: Pick<Finding, "file" | "line">, b: Pick<Finding, "file" | "line">): boolean {
-  return a.file === b.file && Math.abs(a.line - b.line) <= 2;
+/**
+ * A new finding within two lines of an earlier one in the same file, from the same lens, is
+ * treated as the same finding. A design nit next to a bug is a different finding.
+ */
+export function sameIssue(a: Pick<Finding, "file" | "line" | "lens">, b: Pick<Finding, "file" | "line" | "lens">): boolean {
+  return a.file === b.file && lensOf(a) === lensOf(b) && Math.abs(a.line - b.line) <= 2;
 }
 
 /** The last match of a marker in a body: ReviewPilot writes its own markers at the end. */

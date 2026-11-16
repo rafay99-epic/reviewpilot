@@ -2,6 +2,7 @@
 // needs and lists candidate defects. Verify: a fresh agent per candidate tries to disprove it
 // against the code, and only what survives is posted.
 
+import { matchesGlob } from "node:path";
 import { type } from "arktype";
 import type { Submit } from "./agent.ts";
 import { runAgent } from "./agent.ts";
@@ -9,7 +10,7 @@ import type { Config, Rule } from "./config.ts";
 import type { FileDiff } from "./diff.ts";
 import type { Llm, ToolSpec } from "./llm.ts";
 import { bySeverity } from "./render.ts";
-import { diffHash, type Finding, SEVERITIES, type Severity, type Tracked } from "./state.ts";
+import { diffHash, type Finding, type Lens, SEVERITIES, type Severity, type Tracked } from "./state.ts";
 import { inside } from "./tools.ts";
 
 const Severity = type.enumerated(...SEVERITIES);
@@ -52,7 +53,7 @@ function toolSpec(name: string, description: string, schema: type.Any): ToolSpec
 /** A find agent's answer: its candidates, and the files it says it checked. */
 type FindResult = { findings: Finding[]; checked: Set<string> };
 
-export function submitFindings(changed: readonly string[]): Submit<FindResult> {
+export function submitFindings(changed: readonly string[], lens: Lens): Submit<FindResult> {
   return {
     spec: toolSpec("submit_findings", "Submit the review. Call once, after checking every changed file.", Findings),
     parse(args, final) {
@@ -78,6 +79,7 @@ export function submitFindings(changed: readonly string[]): Submit<FindResult> {
           body: c.body.trim(),
           evidence: c.evidence,
           ...(c.rule ? { rule: c.rule } : {}),
+          ...(lens === "ui" ? { lens } : {}),
           })),
         },
       };
@@ -136,6 +138,32 @@ Exception: for a finding reported on an earlier commit, the only question is whe
 
 Call submit_verdict with the verdict, a one or two sentence reason, the evidence lines you checked ("path:line: code"), and the severity you would give it. When confirming, also give a corrected title and body if the original overstates or misdescribes the problem.`;
 
+const UI_SYSTEM = `You are ReviewPilot's UI reviewer. You check that a pull request's UI code stays consistent with this repository's own design system. Bugs and logic are another reviewer's job; ignore them.
+
+You are the first of two passes: a verifier checks each candidate against the code and throws out anything it cannot prove, so list every specific suspicion, but only ones you can point to.
+
+You get the catalog of the repository's shared components and design tokens, its UI docs if any, and part of the diff. You can read any file, search the repository and list directories. Search for how existing screens do the same thing before you call something inconsistent.
+
+Look for:
+- a new component that duplicates one in the catalog (same job, maybe a different name or file)
+- raw primitives or markup where a shared component exists (a hand-built button, card, sheet, list row, text style)
+- hard-coded colors, spacing, radii, font sizes or shadows where a token exists
+- a screen or layout that skips the shared layout wrapper, header, spacing or structure its sibling screens use
+- a variant built by copying and editing a component instead of using its props
+- anything the UI docs forbid or require
+
+Report only on lines this PR changes. Do not report: taste, naming, copy, formatting, accessibility or bugs (other reviewers own those), or code that matches what the rest of the app already does, even if the docs say otherwise.
+
+Severity:
+- major: a duplicate of a shared component, or a pattern that will spread (a new hand-rolled primitive other screens will copy)
+- minor: a one-off hard-coded value or local deviation where a token or shared component exists
+
+Finish by calling submit_findings once, as described in its schema. In evidence, cite both the changed line and the shared component or token it should use ("path:line: code").`;
+
+const VERIFY_UI = `
+
+This is a UI consistency finding. Also check: the shared component or token it names exists at the PR head and is exported; it actually covers this case (its props support the variant, the token means this value); and the rest of the app uses it for the same thing. Reject when the shared one cannot do what the new code needs, or when the codebase itself is split on the pattern.`;
+
 function repoSection(config: Config, rules: readonly Rule[], guidance: string): string {
   const parts: string[] = [];
   if (rules.length) {
@@ -176,6 +204,19 @@ export function chunk(diffs: readonly FileDiff[], size: number): FileDiff[][] {
   }
   if (current.length) parts.push(current);
   return parts;
+}
+
+/**
+ * The find parts: code parts over the whole scope, then UI parts over the scope's UI files
+ * (those matching `uiPaths`, when the repo configures the UI lens). Every UI file is in a code
+ * part too, so code parts alone decide which files count as reviewed.
+ */
+export function findParts(scope: readonly FileDiff[], uiPaths: readonly string[] | undefined): { files: FileDiff[]; lens: Lens }[] {
+  const ui = uiPaths ? scope.filter((d) => uiPaths.some((g) => matchesGlob(d.path, g))) : [];
+  return [
+    ...chunk(scope, CHUNK_CHARS).map((files) => ({ files, lens: "code" as const })),
+    ...chunk(ui, CHUNK_CHARS).map((files) => ({ files, lens: "ui" as const })),
+  ];
 }
 
 /**
@@ -349,6 +390,8 @@ export type ReviewInput = {
   followUp: boolean;
   /** Files whose diff moved since the last review: their earlier findings are checked again. */
   changed: ReadonlySet<string>;
+  /** The design-system catalog (see uiCatalog) when the repo configures `ui`; the UI lens runs only then. */
+  ui?: { paths: readonly string[]; catalog: string };
   /** Open findings the PR author or a maintainer replied to, by fingerprint, with the reply: always checked again. */
   replies: ReadonlyMap<string, string>;
   log: (line: string) => void;
@@ -359,7 +402,7 @@ export type Checked = { finding: Finding; verdict?: VerdictResult; previous?: Tr
 
 export async function review(
   input: ReviewInput,
-): Promise<{ checked: Checked[]; candidates: number; verified: number; failedParts: number; parts: number; reviewed: string[]; findMs: number; verifyMs: number }> {
+): Promise<{ checked: Checked[]; candidates: number; verified: number; failed: Record<Lens, number>; parts: number; reviewed: string[]; findMs: number; verifyMs: number }> {
   const { config, diffs, previous, log } = input;
   const changed = input.scope.filter((d) => d.status !== "deleted").map((d) => d.path);
   const open = previous.filter((p) => p.status === "open");
@@ -374,16 +417,19 @@ export async function review(
   ].filter(Boolean);
 
   const all = diffs.map((d) => `- ${d.path} (${d.status})`).join("\n");
-  const chunks = chunk(input.scope, CHUNK_CHARS);
-  log(`find: ${changed.length} of ${diffs.length} files in ${chunks.length} parts`);
+  const ui = input.ui;
+  const chunks = findParts(input.scope, ui?.paths);
+  const count = (lens: Lens) => chunks.filter((c) => c.lens === lens).length;
+  log(`find: ${changed.length} of ${diffs.length} files in ${count("code")} parts${ui ? `, plus ${count("ui")} UI parts` : ""}`);
 
   const findStart = Date.now();
-  const parts = await pool(chunks, FIND_AGENTS, async (part, i) => {
+  const parts = await pool(chunks, FIND_AGENTS, async ({ files: part, lens }, i) => {
     const mine = part.filter((d) => d.status !== "deleted").map((d) => d.path);
     const user = [
       `PR title: ${input.pr.title}`,
       `PR description:\n${input.pr.body.slice(0, 4000) || "(none)"}`,
       ...history,
+      ...(lens === "ui" && ui ? [ui.catalog ? `Design system catalog (default branch):\n${ui.catalog}` : "No shared components or tokens are configured; compare against how the rest of the app does it."] : []),
       `All files changed in the PR:\n${all}`,
       `Your part (${i + 1} of ${chunks.length}). Diff, left column is the line number at the PR head; + added, - removed:\n\n${part
         .map((d) => {
@@ -398,24 +444,26 @@ export async function review(
     return runAgent({
       llm: input.find,
       root: input.root,
-      system: FIND_SYSTEM + repoSection(config, input.rules, input.guidance),
+      system: (lens === "ui" ? UI_SYSTEM : FIND_SYSTEM) + repoSection(config, input.rules, input.guidance),
       user,
-      submit: submitFindings(mine),
+      submit: submitFindings(mine, lens),
       maxTurns: 12,
       deadline: Date.now() + FIND_MS,
-      log: (line) => log(`[part ${i + 1}] ${line}`),
+      log: (line) => log(`[${lens === "ui" ? "ui " : ""}part ${i + 1}] ${line}`),
     }).catch((e: unknown) => {
-      log(`[part ${i + 1}] find failed: ${e instanceof Error ? e.message : String(e)}`);
+      log(`[${lens === "ui" ? "ui " : ""}part ${i + 1}] find failed: ${e instanceof Error ? e.message : String(e)}`);
       return undefined;
     });
   });
   const findMs = Date.now() - findStart;
-  const failedParts = parts.filter((p) => p === undefined).length;
-  // Files the agents checked. A failed part's files, and any a part ran out of budget on,
-  // are read again on the next run.
-  const reviewed = chunks.flatMap((part, i) => {
+  // Failed parts per lens, so each lens's check says "did not finish" only for its own parts.
+  const failed = { code: 0, ui: 0 };
+  chunks.forEach((c, i) => parts[i] === undefined && (failed[c.lens] += 1));
+  // Files the code agents checked. A failed part's files, and any a part ran out of budget
+  // on, are read again on the next run.
+  const reviewed = chunks.flatMap(({ files, lens }, i) => {
     const p = parts[i];
-    return p ? part.filter((d) => p.checked.has(d.path)).map((d) => d.path) : [];
+    return p && lens === "code" ? files.filter((d) => p.checked.has(d.path)).map((d) => d.path) : [];
   });
   // A candidate must point at a file that exists in the checkout (a model steered by the PR
   // could otherwise put arbitrary text in a link), and may only cite rules that exist.
@@ -456,7 +504,7 @@ export async function review(
     const verdict = await runAgent({
       llm: input.verify,
       root: input.root,
-      system: VERIFY_SYSTEM,
+      system: VERIFY_SYSTEM + (finding.lens === "ui" ? VERIFY_UI : ""),
       user: [
         prev
           ? "This finding was reported on an earlier commit. Check whether it is still present at the current PR head (see the exception for earlier findings)."
@@ -485,7 +533,7 @@ export async function review(
     return { finding, ...(verdict ? { verdict } : {}), ...(prev ? { previous: prev } : {}) };
   });
 
-  return { checked, candidates: found.length, verified: jobs.length, failedParts, parts: chunks.length, reviewed, findMs, verifyMs: Date.now() - verifyStart };
+  return { checked, candidates: found.length, verified: jobs.length, failed, parts: chunks.length, reviewed, findMs, verifyMs: Date.now() - verifyStart };
 }
 
 const Groups = type({ duplicates: "string[][]" });

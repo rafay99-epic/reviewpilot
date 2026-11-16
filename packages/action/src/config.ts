@@ -15,6 +15,23 @@ const Rule = type({
   "paths?": "string[]",
 });
 
+/**
+ * The UI lens: a second reviewer that checks UI files against the repo's own design system
+ * (its components, tokens and design docs) instead of for bugs. Off unless `ui` is set.
+ */
+const Ui = type({
+  /** Files the UI lens reviews, e.g. ["apps/mobile/src/**\/*.tsx"]. */
+  paths: "string[] > 0",
+  /** Where the shared components live; their exports become the catalog the lens checks against. */
+  "components?": "string[]",
+  /** Theme and token files (colors, spacing, type scale). */
+  "tokens?": "string[]",
+  /** Markdown that states the UI rules, under any name (DESIGN.md, docs/ui-consistency.md). */
+  "docs?": "string[]",
+  /** The score at which the ReviewPilot UI check passes. */
+  "pass_score?": "1 | 2 | 3 | 4 | 5",
+});
+
 const FileConfig = type({
   "model?": {
     "name?": "string",
@@ -35,6 +52,7 @@ const FileConfig = type({
     "pass_score?": "1 | 2 | 3 | 4 | 5",
   },
   "rules?": Rule.array(),
+  "ui?": Ui,
   "instructions?": "string",
   "context_files?": "string[]",
   /** A model key sealed for the hosted bot. Only the server reads it; the action ignores it. */
@@ -43,6 +61,7 @@ const FileConfig = type({
 }).onDeepUndeclaredKey("reject");
 
 export type Rule = typeof Rule.infer;
+export type UiConfig = Required<typeof Ui.infer>;
 
 export const DEFAULTS = {
   model: { name: "z-ai/glm-5.3-flash", verify: "z-ai/glm-5.3-flash", effort: "medium" },
@@ -76,6 +95,7 @@ export type Config = {
     pass_score: 1 | 2 | 3 | 4 | 5;
   };
   rules: Rule[];
+  ui?: UiConfig;
   instructions: string;
   context_files: string[];
 };
@@ -102,6 +122,7 @@ export function loadConfig(text: string | undefined): { config: Config; warning?
         ignore: [...DEFAULTS.review.ignore, ...(file.review?.ignore ?? [])],
       },
       rules: file.rules ?? DEFAULTS.rules,
+      ...(file.ui ? { ui: { components: [], tokens: [], docs: [], pass_score: 5, ...file.ui } } : {}),
       instructions: file.instructions ?? DEFAULTS.instructions,
       context_files: file.context_files ?? DEFAULTS.context_files,
     },

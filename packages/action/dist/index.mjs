@@ -15998,7 +15998,9 @@ var FindingSchema = type({
   body: "string",
   /** Exact lines that prove the finding, as `file:line` with the code. */
   evidence: "string[]",
-  "rule?": "string"
+  "rule?": "string",
+  /** Set on findings from the UI lens; code findings carry none, so older state reads as code. */
+  "lens?": "'ui'"
 });
 var TrackedSchema = FindingSchema.and({
   fp: "string",
@@ -16009,15 +16011,22 @@ var TrackedSchema = FindingSchema.and({
 var StateSchema = type({
   head: "string",
   score: "1 | 2 | 3 | 4 | 5",
+  /** The UI lens's score, when the repo configures `ui`. `score` covers code findings only. */
+  "uiScore?": "1 | 2 | 3 | 4 | 5",
   findings: TrackedSchema.array(),
   "files?": "Record<string, string>"
 });
+var lensOf = (f) => f.lens ?? "code";
 function score(findings) {
   const critical = findings.filter((f) => f.severity === "critical").length;
   if (critical >= 2) return 1;
   if (critical === 1) return 2;
   if (findings.some((f) => f.severity === "major")) return 3;
   return findings.length > 0 ? 4 : 5;
+}
+function lensView(state, lens) {
+  const findings = state.findings.filter((f) => lensOf(f) === lens);
+  return { ...state, findings, score: lens === "ui" ? state.uiScore ?? 5 : state.score };
 }
 function fingerprint(f) {
   const title = f.title.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -16026,7 +16035,7 @@ ${title}`).digest("hex").slice(0, 12);
 }
 var diffHash = (numbered) => createHash("sha1").update(numbered).digest("hex").slice(0, 12);
 function sameIssue(a, b) {
-  return a.file === b.file && Math.abs(a.line - b.line) <= 2;
+  return a.file === b.file && lensOf(a) === lensOf(b) && Math.abs(a.line - b.line) <= 2;
 }
 var lastMarker = (body, marker) => [...body.matchAll(marker)].at(-1)?.[1];
 var MARKER = /<!-- reviewpilot:state ([A-Za-z0-9+/=]+) -->/g;
@@ -16091,6 +16100,18 @@ var Rule = type({
   "severity?": Severity,
   "paths?": "string[]"
 });
+var Ui = type({
+  /** Files the UI lens reviews, e.g. ["apps/mobile/src/**\/*.tsx"]. */
+  paths: "string[] > 0",
+  /** Where the shared components live; their exports become the catalog the lens checks against. */
+  "components?": "string[]",
+  /** Theme and token files (colors, spacing, type scale). */
+  "tokens?": "string[]",
+  /** Markdown that states the UI rules, under any name (DESIGN.md, docs/ui-consistency.md). */
+  "docs?": "string[]",
+  /** The score at which the ReviewPilot UI check passes. */
+  "pass_score?": "1 | 2 | 3 | 4 | 5"
+});
 var FileConfig = type({
   "model?": {
     "name?": "string",
@@ -16111,6 +16132,7 @@ var FileConfig = type({
     "pass_score?": "1 | 2 | 3 | 4 | 5"
   },
   "rules?": Rule.array(),
+  "ui?": Ui,
   "instructions?": "string",
   "context_files?": "string[]",
   /** A model key sealed for the hosted bot. Only the server reads it; the action ignores it. */
@@ -16169,6 +16191,7 @@ function loadConfig(text) {
         ignore: [...DEFAULTS.review.ignore, ...file.review?.ignore ?? []]
       },
       rules: file.rules ?? DEFAULTS.rules,
+      ...file.ui ? { ui: { components: [], tokens: [], docs: [], pass_score: 5, ...file.ui } } : {},
       instructions: file.instructions ?? DEFAULTS.instructions,
       context_files: file.context_files ?? DEFAULTS.context_files
     }
@@ -16238,6 +16261,9 @@ function anchor(file, start, end) {
   const first = start < last && file.commentable.has(start) && file.hunkOf.get(start) === file.hunkOf.get(last) ? start : void 0;
   return first === void 0 ? { line: last } : { line: last, startLine: first };
 }
+
+// src/catalog.ts
+import { matchesGlob as matchesGlob3 } from "node:path";
 
 // src/git.ts
 import { execFile } from "node:child_process";
@@ -16318,444 +16344,10 @@ async function fetchRef(root, branch) {
   await git(root, "fetch", "--no-tags", "origin", `+refs/heads/${branch}:refs/reviewpilot/default`);
   return "refs/reviewpilot/default";
 }
+var filesAt = async (root, ref) => (await git(root, "-c", "core.quotePath=off", "ls-tree", "-r", "--name-only", ref)).split("\n").filter(Boolean);
 
-// src/github.ts
-var User = type({ login: "string" });
-var Pr = type({
-  number: "number",
-  state: "'open' | 'closed'",
-  draft: "boolean",
-  title: "string",
-  body: "string | null",
-  user: User,
-  head: { sha: "string" },
-  base: { ref: "string", sha: "string", repo: { default_branch: "string" } }
-});
-var IssueComment = type({ id: "number", node_id: "string", body: "string", user: User.or("null") });
-var ReviewComment = type({
-  id: "number",
-  body: "string",
-  "in_reply_to_id?": "number",
-  /** The commit the comment was made on; unlike commit_id it does not move when the line goes stale. */
-  "original_commit_id?": "string",
-  user: User.or("null")
-});
-var Created = type({ id: "number" });
-var CheckRuns = type({ check_runs: type({ id: "number", started_at: "string | null" }).array() });
-var GraphQlEnvelope = type({ "errors?": type({ message: "string" }).array(), "data?": "unknown" });
-var ThreadsData = type({
-  data: {
-    repository: {
-      pullRequest: {
-        reviewThreads: {
-          nodes: type({
-            id: "string",
-            isResolved: "boolean",
-            resolvedBy: User.or("null"),
-            comments: {
-              nodes: type({
-                id: "string",
-                databaseId: "number | null",
-                body: "string",
-                authorAssociation: "string",
-                author: User.or("null")
-              }).array()
-            }
-          }).array()
-        }
-      }
-    }
-  }
-});
-var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-function createGitHub(token, repo) {
-  const api = process.env.GITHUB_API_URL ?? "https://api.github.com";
-  async function call(schema2, method, path, body) {
-    const idempotent = method !== "POST" || path === "/graphql";
-    for (let attempt = 0; ; attempt++) {
-      const res = await fetch(`${api}${path}`, {
-        method,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/vnd.github+json",
-          "X-GitHub-Api-Version": "2022-11-28",
-          "User-Agent": "reviewpilot",
-          ...body ? { "Content-Type": "application/json" } : {}
-        },
-        ...body ? { body: JSON.stringify(body) } : {},
-        signal: AbortSignal.timeout(3e4)
-      }).catch((e) => e instanceof Error ? e : new Error(String(e)));
-      const status = res instanceof Error ? 0 : res.status;
-      const after = res instanceof Error ? null : res.headers.get("retry-after");
-      const limited = status === 429 || status === 403 && after !== null;
-      const retryable = limited || idempotent && (status === 0 || status >= 500);
-      if (retryable && attempt < 3) {
-        const wait = after !== null ? Number(after) * 1e3 : NaN;
-        await sleep(Number.isFinite(wait) && wait > 0 ? Math.min(wait, 6e4) : 2 ** attempt * 1e3);
-        continue;
-      }
-      if (res instanceof Error) throw new Error(`GitHub ${method} ${path}: ${res.message}`);
-      if (!res.ok) throw new Error(`GitHub ${method} ${path}: ${res.status} ${(await res.text()).slice(0, 300)}`);
-      try {
-        return schema2.assert(res.status === 204 ? void 0 : await res.json());
-      } catch (e) {
-        throw new Error(`GitHub ${method} ${path}: unexpected response, ${e instanceof Error ? e.message : String(e)}`);
-      }
-    }
-  }
-  async function all(schema2, path) {
-    const page = schema2.array();
-    const out = [];
-    for (let n = 1; n <= 30; n++) {
-      const batch = await call(page, "GET", `${path}${path.includes("?") ? "&" : "?"}per_page=100&page=${n}`);
-      out.push(...batch);
-      if (batch.length < 100) break;
-    }
-    return out;
-  }
-  async function graphql(schema2, query, variables) {
-    const res = await call(GraphQlEnvelope, "POST", "/graphql", { query, variables });
-    if (res.errors?.length) throw new Error(`GitHub GraphQL: ${res.errors.map((e) => e.message).join("; ")}`);
-    try {
-      return schema2.assert(res);
-    } catch (e) {
-      throw new Error(`GitHub GraphQL: unexpected response, ${e instanceof Error ? e.message : String(e)}`);
-    }
-  }
-  const [owner, name] = repo.split("/");
-  const r = `/repos/${repo}`;
-  const done = type("unknown");
-  return {
-    pr: (n) => call(Pr, "GET", `${r}/pulls/${n}`),
-    issueComments: (n) => all(IssueComment, `${r}/issues/${n}/comments`),
-    reviewComments: (n) => all(ReviewComment, `${r}/pulls/${n}/comments`),
-    comment: (n, body) => call(Created, "POST", `${r}/issues/${n}/comments`, { body }),
-    editComment: (id, body) => call(Created, "PATCH", `${r}/issues/comments/${id}`, { body }),
-    /** The ReviewPilot check on a commit. Needs Checks write on the token. */
-    createCheck: (head, body) => call(Created, "POST", `${r}/check-runs`, { name: "ReviewPilot", head_sha: head, ...body }),
-    updateCheck: (id, body) => call(Created, "PATCH", `${r}/check-runs/${id}`, body),
-    /** ReviewPilot checks on a commit that are still in progress, with when they started. */
-    runningChecks: async (head) => (await call(CheckRuns, "GET", `${r}/commits/${head}/check-runs?check_name=ReviewPilot&status=in_progress&per_page=100`)).check_runs,
-    react: (commentId, content) => call(done, "POST", `${r}/issues/comments/${commentId}/reactions`, { content }),
-    reply: (n, commentId, body) => call(Created, "POST", `${r}/pulls/${n}/comments/${commentId}/replies`, { body }),
-    review: (n, commitId, comments) => call(Created, "POST", `${r}/pulls/${n}/reviews`, {
-      commit_id: commitId,
-      event: "COMMENT",
-      comments: comments.map((c) => ({
-        path: c.path,
-        line: c.line,
-        side: "RIGHT",
-        ...c.start_line ? { start_line: c.start_line, start_side: "RIGHT" } : {},
-        body: c.body
-      }))
-    }),
-    /** Removes an old summary; if deleting is not allowed, collapses it as outdated instead. */
-    async retire(comment) {
-      await call(done, "DELETE", `${r}/issues/comments/${comment.id}`).catch(
-        () => graphql(done, "mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized}}}", { id: comment.node_id })
-      );
-    },
-    async threads(n) {
-      const query = `query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){pullRequest(number:$n){
-        reviewThreads(first:100){nodes{id isResolved resolvedBy{login} comments(first:100){nodes{id databaseId body authorAssociation author{login}}}}}}}}`;
-      const res = await graphql(ThreadsData, query, { owner, name, n });
-      return res.data.repository.pullRequest.reviewThreads.nodes.map((t) => ({
-        id: t.id,
-        resolved: t.isResolved,
-        resolvedBy: t.resolvedBy?.login ?? "",
-        comments: t.comments.nodes.map((c) => ({
-          id: c.id,
-          databaseId: c.databaseId,
-          body: c.body,
-          author: c.author?.login ?? "",
-          association: c.authorAssociation
-        }))
-      }));
-    },
-    /**
-     * Closes a fixed finding: collapses its comment as outdated, then resolves the thread.
-     * GitHub only lets an App resolve threads with Contents write, which a reviewer should
-     * not need, so without it the thread stays open but collapsed. Returns whether it resolved.
-     */
-    async close(thread) {
-      const root = thread.comments[0];
-      if (root) {
-        await graphql(done, "mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized}}}", { id: root.id });
-      }
-      return graphql(done, "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}", { id: thread.id }).then(
-        () => true,
-        (e) => {
-          if (/not accessible by integration/i.test(String(e))) return false;
-          throw e;
-        }
-      );
-    }
-  };
-}
-
-// src/llm.ts
-var Completion = type({
-  "choices?": type({
-    "message?": {
-      "content?": "string | null",
-      "tool_calls?": type({ id: "string", type: "'function'", function: { name: "string", arguments: "string" } }).array()
-    }
-  }).array(),
-  // Providers differ here: some send null for the details, so they are optional and nullable.
-  "usage?": {
-    "prompt_tokens?": "number",
-    "completion_tokens?": "number",
-    "prompt_tokens_details?": type({ "cached_tokens?": "number | null" }).or("null")
-  },
-  "error?": { "message?": "string" }
-});
-var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
-function createLlm(opts) {
-  const usage = { prompt: 0, completion: 0, calls: 0, cached: 0 };
-  const url2 = `${opts.baseUrl.replace(/\/$/, "")}/chat/completions`;
-  let sendEffort = opts.effort !== "none";
-  async function chat(messages, tools, force, deadline) {
-    const left = () => deadline === void 0 ? Infinity : deadline - Date.now();
-    for (let attempt = 0; ; attempt++) {
-      const res = await fetch(url2, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${opts.apiKey}`,
-          "Content-Type": "application/json",
-          "User-Agent": "reviewpilot/0.1"
-        },
-        body: JSON.stringify({
-          model: opts.model,
-          messages,
-          tools,
-          tool_choice: force ? { type: "function", function: { name: force } } : "auto",
-          // "none" leaves the parameter out, for providers that reject it.
-          ...sendEffort ? { reasoning_effort: opts.effort } : {}
-        }),
-        // Never past the deadline for a normal turn (at least 60s), but the forced final call gets
-        // two minutes even past it: that answer is the part's whole result.
-        signal: AbortSignal.timeout(Math.max(force ? 12e4 : 6e4, Math.min(opts.timeoutMs ?? 24e4, left())))
-      }).catch((e) => ({ ok: false, status: 0, error: e }));
-      const retryable = !res.ok && (res.status === 0 || res.status === 429 || res.status >= 500);
-      if (retryable && attempt < 4 && left() > 15e3) {
-        const header = "headers" in res ? res.headers.get("retry-after") : null;
-        const wait = header ? Number(header) * 1e3 || Date.parse(header) - Date.now() : NaN;
-        await sleep2(Number.isFinite(wait) && wait > 0 ? Math.min(wait, 6e4) : 2 ** attempt * 3e3);
-        continue;
-      }
-      if (!res.ok) {
-        const detail = "text" in res ? await res.text().catch((e) => String(e)) : String(res.error);
-        if (res.status === 400 && sendEffort && /reasoning/i.test(detail) && attempt < 4) {
-          sendEffort = false;
-          continue;
-        }
-        throw new Error(`${opts.model}: HTTP ${res.status} ${detail.slice(0, 300)}`);
-      }
-      const text = await res.text().catch(() => void 0);
-      if (text === void 0 && attempt < 4 && left() > 15e3) {
-        await sleep2(2 ** attempt * 3e3);
-        continue;
-      }
-      if (text === void 0) throw new Error(`${opts.model}: the response body could not be read`);
-      let json3;
-      try {
-        json3 = JSON.parse(text);
-      } catch {
-        json3 = void 0;
-      }
-      const parsed2 = Completion(json3);
-      const data = parsed2 instanceof type.errors ? void 0 : parsed2;
-      if (!data && attempt < 4 && left() > 15e3) {
-        await sleep2(2 ** attempt * 3e3);
-        continue;
-      }
-      if (!data) throw new Error(`${opts.model}: response is not a chat completion: ${text.slice(0, 200)}`);
-      const message = data.choices?.[0]?.message;
-      if (!message && attempt < 4 && left() > 15e3) {
-        await sleep2(2 ** attempt * 3e3);
-        continue;
-      }
-      if (!message) throw new Error(`${opts.model}: empty response ${data.error?.message ?? ""}`);
-      usage.calls += 1;
-      usage.prompt += data.usage?.prompt_tokens ?? 0;
-      usage.completion += data.usage?.completion_tokens ?? 0;
-      usage.cached += data.usage?.prompt_tokens_details?.cached_tokens ?? 0;
-      return {
-        role: "assistant",
-        content: message.content ?? null,
-        ...message.tool_calls?.length ? { tool_calls: message.tool_calls } : {}
-      };
-    }
-  }
-  return { model: opts.model, chat, usage };
-}
-
-// src/log.ts
-import { appendFile } from "node:fs/promises";
-var seconds = (ms) => ms >= 6e4 ? `${Math.floor(ms / 6e4)}m ${Math.floor(ms % 6e4 / 1e3)}s` : `${(ms / 1e3).toFixed(1)}s`;
-function createLog(actions) {
-  const phases = [];
-  const safe = (text) => actions ? text.replace(/^::/gm, ": :") : text;
-  const encode = (text) => text.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
-  return {
-    phases,
-    line: (text) => console.log(safe(text)),
-    warn: (text) => console.log(actions ? `::warning::${encode(text)}` : `warning: ${text}`),
-    /** Runs one phase inside a log group and records how long it took. */
-    async phase(name, fn2) {
-      const start = performance.now();
-      console.log(actions ? `::group::${name}` : `> ${name}`);
-      try {
-        return await fn2();
-      } finally {
-        const ms = Math.round(performance.now() - start);
-        phases.push({ name, ms });
-        if (actions) console.log("::endgroup::");
-        console.log(`${name}: ${seconds(ms)}`);
-      }
-    },
-    /** Appends the run report to the Actions job summary, when there is one. */
-    async report(facts) {
-      const file = process.env.GITHUB_STEP_SUMMARY;
-      if (!file) return;
-      const rows = phases.map((p) => `| ${p.name} | ${seconds(p.ms)} |`).join("\n");
-      const total = phases.reduce((sum, p) => sum + p.ms, 0);
-      await appendFile(
-        file,
-        [
-          `### ReviewPilot run: ${facts.score}/5`,
-          "",
-          `${facts.findings.new} new, ${facts.findings.open} open, ${facts.findings.fixed} fixed. ${facts.verified} of ${facts.candidates} candidates verified.`,
-          "",
-          "| Phase | Time |",
-          "| --- | --- |",
-          rows,
-          `| **Total** | **${seconds(total)}** |`,
-          "",
-          `Model \`${facts.model}\`: ${facts.usage.calls} calls, ${facts.usage.prompt.toLocaleString("en")} input (${facts.usage.cached.toLocaleString("en")} cached) and ${facts.usage.completion.toLocaleString("en")} output tokens.`,
-          ""
-        ].join("\n")
-      );
-    }
-  };
-}
-
-// src/render.ts
-var ORDER = { critical: 0, major: 1, minor: 2 };
-var bySeverity = (a, b) => ORDER[a.severity] - ORDER[b.severity];
-var clean = (text) => text.replace(/<!--|-->/g, "");
-var flat = (text) => clean(text).replace(/\s+/g, " ").trim();
-var linkText = (text) => flat(text).replace(/[[\]()]/g, "");
-var fence = (lines) => `\`\`\`text
-${lines.join("\n").replaceAll("```", "'''")}
-\`\`\``;
-function inlineBody(f) {
-  const tag = f.rule ? ` \xB7 rule \`${linkText(f.rule)}\`` : "";
-  return [
-    `**${flat(f.title)}** \xB7 ${f.severity}${tag}`,
-    "",
-    clean(f.body),
-    "",
-    `<details><summary>Evidence</summary>
-
-${fence(f.evidence.map(clean))}
-</details>`,
-    findingTag(f.fp)
-  ].join("\n");
-}
-var duration = (s) => s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
-var count = (n) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n);
-var tokens = (t) => {
-  if (!t.prompt) return "no model calls";
-  const share = Math.floor(t.cached / t.prompt * 100);
-  return `${count(t.prompt)} tokens in${share > 0 ? `, ${share}% cached` : ""}`;
-};
-function blockers(state, pass = 5) {
-  const open = state.findings.filter((f) => f.status === "open");
-  if (!open.length) return "";
-  const counts = SEVERITIES.flatMap((s) => {
-    const n = open.filter((f) => f.severity === s).length;
-    return n ? [`${n} ${s}`] : [];
-  }).join(", ");
-  if (state.score >= pass) return `**Passes at ${pass}/5.** Still open: ${counts}.`;
-  return `**Not ${pass}/5 because of:** ${counts}. Fix them, or reply to a finding (or resolve its thread) to dismiss it.`;
-}
-function checkResult(state, run2, summaryUrl, partial, pass = 5) {
-  const open = state.findings.filter((f) => f.status === "open").sort(bySeverity);
-  const annotations = open.slice(0, 50).map((f) => ({
-    path: f.file,
-    // GitHub rejects the whole update for one bad annotation, so lines start at 1 and
-    // messages stay well under its 64 KB limit.
-    start_line: Math.max(1, f.line),
-    end_line: Math.max(1, f.line, f.endLine),
-    annotation_level: f.severity === "minor" ? "warning" : "failure",
-    title: `${f.severity}: ${flat(f.title)}`.slice(0, 255),
-    message: clean(f.body).slice(0, 4e3)
-  }));
-  return {
-    conclusion: state.score < pass || partial === "incomplete" ? "failure" : partial === "skipped" ? "neutral" : "success",
-    details_url: summaryUrl,
-    output: {
-      title: `${state.score}/5${partial ? " (partial)" : ""} \xB7 ${open.length} open \xB7 ${duration(run2.seconds)}`,
-      summary: [
-        `**${state.score}/5** on ${run2.head.slice(0, 7)}${pass < 5 && state.score >= pass ? ` (passes at ${pass}/5)` : ""}. [Full summary](${summaryUrl}).`,
-        ...blockers(state, pass) ? ["", blockers(state, pass)] : [],
-        ...partial === "incomplete" ? ["", "**The review did not finish**, so it cannot pass: part of the diff or some checks failed. Comment `/review` to retry."] : [],
-        ...run2.warning ? ["", `> ${run2.warning}`] : [],
-        ...open.length > annotations.length ? ["", `${open.length - annotations.length} more open findings are in the summary.`] : [],
-        "",
-        `${run2.reviewed === run2.files ? `${run2.files} files` : `${run2.reviewed} of ${run2.files} files read`} \xB7 ${run2.candidates} candidates, ${run2.verified} checks \xB7 ${duration(run2.seconds)} (${run2.timing}) \xB7 ${tokens(run2.tokens)}`
-      ].join("\n"),
-      annotations
-    }
-  };
-}
-function summaryBody(state, prev, outside, run2, pass = 5) {
-  const open = state.findings.filter((f) => f.status === "open").sort(bySeverity);
-  const fixed = state.findings.filter((f) => f.status === "fixed" && prev?.findings.some((p) => p.fp === f.fp && p.status === "open"));
-  const fresh = open.filter((f) => !prev?.findings.some((p) => p.fp === f.fp && p.status === "open"));
-  const link = (f) => `[${linkText(f.file.split("/").pop() ?? f.file)}:${f.line}](https://github.com/${run2.repo}/blob/${run2.head}/${f.file.split("/").map(encodeURIComponent).join("/")}#L${f.line})`;
-  const lines = [`## ReviewPilot: ${state.score}/5`];
-  if (prev && prev.head !== state.head) {
-    const move = prev.score === state.score ? `${state.score}/5` : `${prev.score}/5 \u2192 ${state.score}/5`;
-    lines.push(`<sub>Since ${prev.head.slice(0, 7)}: ${move} \xB7 ${fixed.length} fixed \xB7 ${fresh.length} new \xB7 ${open.length} open</sub>`);
-  }
-  lines.push("");
-  if (open.length) {
-    lines.push(blockers(state, pass), "");
-    lines.push("| Severity | Finding | Where |", "| --- | --- | --- |");
-    for (const f of open.filter((o) => !outside.includes(o))) lines.push(`| ${f.severity} | ${flat(f.title).replaceAll("|", "\\|")} | ${link(f)} |`);
-  } else {
-    lines.push("No verified issues.");
-  }
-  const item = (f) => `- **${flat(f.title)}** (${link(f)}, ${f.severity}): ${flat(f.body)}`;
-  const unposted = outside.filter((f) => state.findings.includes(f));
-  const info = outside.filter((f) => !state.findings.includes(f));
-  if (unposted.length) lines.push("", "**Could not be posted inline**", "", ...unposted.map(item));
-  if (info.length) lines.push("", "**Outside the changed lines** (for information, not scored)", "", ...info.map(item));
-  if (fixed.length) {
-    lines.push("", `<details><summary>Fixed since last review (${fixed.length})</summary>
-`);
-    for (const f of fixed) lines.push(`- ${flat(f.title)} (${f.file}:${f.line})`);
-    lines.push("\n</details>");
-  }
-  if (run2.warning) lines.push("", `> ${run2.warning}`);
-  lines.push(
-    "",
-    `<sub>Reviewed ${run2.head.slice(0, 7)} with ${run2.model} \xB7 ${run2.reviewed === run2.files ? `${run2.files} files` : `${run2.reviewed} of ${run2.files} files read`} \xB7 ${run2.candidates} candidates, ${run2.verified} checks \xB7 ${duration(run2.seconds)} (${run2.timing}) \xB7 ${tokens(run2.tokens)}. Every finding was re-checked against the code before posting.</sub>`,
-    SUMMARY_TAG,
-    writeState(state)
-  );
-  return lines.join("\n");
-}
-var PROGRESS = "## ReviewPilot: reviewing";
-var progressBody = (head, prev) => [
-  `${PROGRESS} ${head.slice(0, 7)}`,
-  "",
-  "Reading the diff and the code around it, then re-checking each finding. This usually takes a few minutes.",
-  SUMMARY_TAG,
-  prev ?? ""
-].join("\n");
+// src/review.ts
+import { matchesGlob as matchesGlob2 } from "node:path";
 
 // src/tools.ts
 import { execFile as execFile2 } from "node:child_process";
@@ -16942,6 +16534,128 @@ async function runAgent(opts) {
   throw new Error(`${name} was never called after ${opts.maxTurns + 2} turns`);
 }
 
+// src/render.ts
+var ORDER = { critical: 0, major: 1, minor: 2 };
+var bySeverity = (a, b) => ORDER[a.severity] - ORDER[b.severity];
+var clean = (text) => text.replace(/<!--|-->/g, "");
+var flat = (text) => clean(text).replace(/\s+/g, " ").trim();
+var linkText = (text) => flat(text).replace(/[[\]()]/g, "");
+var fence = (lines) => `\`\`\`text
+${lines.join("\n").replaceAll("```", "'''")}
+\`\`\``;
+function inlineBody(f) {
+  const tag = `${f.lens === "ui" ? " \xB7 UI" : ""}${f.rule ? ` \xB7 rule \`${linkText(f.rule)}\`` : ""}`;
+  return [
+    `**${flat(f.title)}** \xB7 ${f.severity}${tag}`,
+    "",
+    clean(f.body),
+    "",
+    `<details><summary>Evidence</summary>
+
+${fence(f.evidence.map(clean))}
+</details>`,
+    findingTag(f.fp)
+  ].join("\n");
+}
+var duration = (s) => s >= 60 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${s}s`;
+var count = (n) => n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n);
+var tokens = (t) => {
+  if (!t.prompt) return "no model calls";
+  const share = Math.floor(t.cached / t.prompt * 100);
+  return `${count(t.prompt)} tokens in${share > 0 ? `, ${share}% cached` : ""}`;
+};
+function blockers(state, pass = 5) {
+  const open = state.findings.filter((f) => f.status === "open");
+  if (!open.length) return "";
+  const counts = SEVERITIES.flatMap((s) => {
+    const n = open.filter((f) => f.severity === s).length;
+    return n ? [`${n} ${s}`] : [];
+  }).join(", ");
+  if (state.score >= pass) return `**Passes at ${pass}/5.** Still open: ${counts}.`;
+  return `**Not ${pass}/5 because of:** ${counts}. Fix them, or reply to a finding (or resolve its thread) to dismiss it.`;
+}
+function checkResult(state, run2, summaryUrl, partial, pass = 5) {
+  const open = state.findings.filter((f) => f.status === "open").sort(bySeverity);
+  const annotations = open.slice(0, 50).map((f) => ({
+    path: f.file,
+    // GitHub rejects the whole update for one bad annotation, so lines start at 1 and
+    // messages stay well under its 64 KB limit.
+    start_line: Math.max(1, f.line),
+    end_line: Math.max(1, f.line, f.endLine),
+    annotation_level: f.severity === "minor" ? "warning" : "failure",
+    title: `${f.severity}: ${flat(f.title)}`.slice(0, 255),
+    message: clean(f.body).slice(0, 4e3)
+  }));
+  return {
+    conclusion: state.score < pass || partial === "incomplete" ? "failure" : partial === "skipped" ? "neutral" : "success",
+    details_url: summaryUrl,
+    output: {
+      title: `${state.score}/5${partial ? " (partial)" : ""} \xB7 ${open.length} open \xB7 ${duration(run2.seconds)}`,
+      summary: [
+        `**${state.score}/5** on ${run2.head.slice(0, 7)}${pass < 5 && state.score >= pass ? ` (passes at ${pass}/5)` : ""}. [Full summary](${summaryUrl}).`,
+        ...blockers(state, pass) ? ["", blockers(state, pass)] : [],
+        ...partial === "incomplete" ? ["", "**The review did not finish**, so it cannot pass: part of the diff or some checks failed. Comment `/review` to retry."] : [],
+        ...run2.warning ? ["", `> ${run2.warning}`] : [],
+        ...open.length > annotations.length ? ["", `${open.length - annotations.length} more open findings are in the summary.`] : [],
+        "",
+        `${run2.reviewed === run2.files ? `${run2.files} files` : `${run2.reviewed} of ${run2.files} files read`} \xB7 ${run2.candidates} candidates, ${run2.verified} checks \xB7 ${duration(run2.seconds)} (${run2.timing}) \xB7 ${tokens(run2.tokens)}`
+      ].join("\n"),
+      annotations
+    }
+  };
+}
+function summaryBody(state, prev, outside, run2, pass = 5, uiPass) {
+  const open = state.findings.filter((f) => f.status === "open").sort(bySeverity);
+  const fixed = state.findings.filter((f) => f.status === "fixed" && prev?.findings.some((p) => p.fp === f.fp && p.status === "open"));
+  const fresh = open.filter((f) => !prev?.findings.some((p) => p.fp === f.fp && p.status === "open"));
+  const link = (f) => `[${linkText(f.file.split("/").pop() ?? f.file)}:${f.line}](https://github.com/${run2.repo}/blob/${run2.head}/${f.file.split("/").map(encodeURIComponent).join("/")}#L${f.line})`;
+  const ui = uiPass !== void 0 ? lensView(state, "ui") : void 0;
+  const lines = [`## ReviewPilot: ${state.score}/5${ui ? ` \xB7 UI ${ui.score}/5` : ""}`];
+  if (prev && prev.head !== state.head) {
+    const move = prev.score === state.score ? `${state.score}/5` : `${prev.score}/5 \u2192 ${state.score}/5`;
+    lines.push(`<sub>Since ${prev.head.slice(0, 7)}: ${move} \xB7 ${fixed.length} fixed \xB7 ${fresh.length} new \xB7 ${open.length} open</sub>`);
+  }
+  lines.push("");
+  if (open.length) {
+    const code = blockers(lensView(state, "code"), pass);
+    const design = ui && blockers(ui, uiPass);
+    lines.push(...code ? [code] : [], ...design ? [`UI: ${design}`] : [], "");
+    lines.push("| Severity | Finding | Where |", "| --- | --- | --- |");
+    for (const f of open.filter((o) => !outside.includes(o))) {
+      lines.push(`| ${f.severity}${f.lens === "ui" ? " \xB7 UI" : ""} | ${flat(f.title).replaceAll("|", "\\|")} | ${link(f)} |`);
+    }
+  } else {
+    lines.push("No verified issues.");
+  }
+  const item = (f) => `- **${flat(f.title)}** (${link(f)}, ${f.severity}): ${flat(f.body)}`;
+  const unposted = outside.filter((f) => state.findings.includes(f));
+  const info = outside.filter((f) => !state.findings.includes(f));
+  if (unposted.length) lines.push("", "**Could not be posted inline**", "", ...unposted.map(item));
+  if (info.length) lines.push("", "**Outside the changed lines** (for information, not scored)", "", ...info.map(item));
+  if (fixed.length) {
+    lines.push("", `<details><summary>Fixed since last review (${fixed.length})</summary>
+`);
+    for (const f of fixed) lines.push(`- ${flat(f.title)} (${f.file}:${f.line})`);
+    lines.push("\n</details>");
+  }
+  if (run2.warning) lines.push("", `> ${run2.warning}`);
+  lines.push(
+    "",
+    `<sub>Reviewed ${run2.head.slice(0, 7)} with ${run2.model} \xB7 ${run2.reviewed === run2.files ? `${run2.files} files` : `${run2.reviewed} of ${run2.files} files read`} \xB7 ${run2.candidates} candidates, ${run2.verified} checks \xB7 ${duration(run2.seconds)} (${run2.timing}) \xB7 ${tokens(run2.tokens)}. Every finding was re-checked against the code before posting.</sub>`,
+    SUMMARY_TAG,
+    writeState(state)
+  );
+  return lines.join("\n");
+}
+var PROGRESS = "## ReviewPilot: reviewing";
+var progressBody = (head, prev) => [
+  `${PROGRESS} ${head.slice(0, 7)}`,
+  "",
+  "Reading the diff and the code around it, then re-checking each finding. This usually takes a few minutes.",
+  SUMMARY_TAG,
+  prev ?? ""
+].join("\n");
+
 // src/review.ts
 var Severity2 = type.enumerated(...SEVERITIES);
 var Candidate = type({
@@ -16972,7 +16686,7 @@ function toolSpec(name, description, schema2) {
   const parameters = Object.fromEntries(Object.entries(schema2.toJsonSchema()).filter(([key]) => key !== "$schema"));
   return { type: "function", function: { name, description, parameters } };
 }
-function submitFindings(changed) {
+function submitFindings(changed, lens) {
   return {
     spec: toolSpec("submit_findings", "Submit the review. Call once, after checking every changed file.", Findings),
     parse(args2, final) {
@@ -16996,7 +16710,8 @@ function submitFindings(changed) {
             title: c.title.trim(),
             body: c.body.trim(),
             evidence: c.evidence,
-            ...c.rule ? { rule: c.rule } : {}
+            ...c.rule ? { rule: c.rule } : {},
+            ...lens === "ui" ? { lens } : {}
           }))
         }
       };
@@ -17049,6 +16764,30 @@ Confirm only if every step holds. Reject if any step fails or you cannot finish 
 Exception: for a finding reported on an earlier commit, the only question is whether the problem is still in the code. A rejection marks it fixed, so reject only when you can show the current code no longer has it; if you cannot finish the check, confirm it.
 
 Call submit_verdict with the verdict, a one or two sentence reason, the evidence lines you checked ("path:line: code"), and the severity you would give it. When confirming, also give a corrected title and body if the original overstates or misdescribes the problem.`;
+var UI_SYSTEM = `You are ReviewPilot's UI reviewer. You check that a pull request's UI code stays consistent with this repository's own design system. Bugs and logic are another reviewer's job; ignore them.
+
+You are the first of two passes: a verifier checks each candidate against the code and throws out anything it cannot prove, so list every specific suspicion, but only ones you can point to.
+
+You get the catalog of the repository's shared components and design tokens, its UI docs if any, and part of the diff. You can read any file, search the repository and list directories. Search for how existing screens do the same thing before you call something inconsistent.
+
+Look for:
+- a new component that duplicates one in the catalog (same job, maybe a different name or file)
+- raw primitives or markup where a shared component exists (a hand-built button, card, sheet, list row, text style)
+- hard-coded colors, spacing, radii, font sizes or shadows where a token exists
+- a screen or layout that skips the shared layout wrapper, header, spacing or structure its sibling screens use
+- a variant built by copying and editing a component instead of using its props
+- anything the UI docs forbid or require
+
+Report only on lines this PR changes. Do not report: taste, naming, copy, formatting, accessibility or bugs (other reviewers own those), or code that matches what the rest of the app already does, even if the docs say otherwise.
+
+Severity:
+- major: a duplicate of a shared component, or a pattern that will spread (a new hand-rolled primitive other screens will copy)
+- minor: a one-off hard-coded value or local deviation where a token or shared component exists
+
+Finish by calling submit_findings once, as described in its schema. In evidence, cite both the changed line and the shared component or token it should use ("path:line: code").`;
+var VERIFY_UI = `
+
+This is a UI consistency finding. Also check: the shared component or token it names exists at the PR head and is exported; it actually covers this case (its props support the variant, the token means this value); and the rest of the app uses it for the same thing. Reject when the shared one cannot do what the new code needs, or when the codebase itself is split on the pattern.`;
 function repoSection(config, rules, guidance) {
   const parts = [];
   if (rules.length) {
@@ -17088,6 +16827,13 @@ function chunk(diffs, size) {
   }
   if (current.length) parts.push(current);
   return parts;
+}
+function findParts(scope2, uiPaths) {
+  const ui = uiPaths ? scope2.filter((d) => uiPaths.some((g) => matchesGlob2(d.path, g))) : [];
+  return [
+    ...chunk(scope2, CHUNK_CHARS).map((files) => ({ files, lens: "code" })),
+    ...chunk(ui, CHUNK_CHARS).map((files) => ({ files, lens: "ui" }))
+  ];
 }
 function focus(diffs, seen, since) {
   const fresh = /* @__PURE__ */ new Map();
@@ -17156,9 +16902,9 @@ var CHUNK_CHARS = 25e3;
 var MAX_VERIFY = 25;
 var FIND_AGENTS = 6;
 var VERIFY_AGENTS = 8;
-var seconds2 = (name, fallback) => (Number(process.env[name]) || fallback) * 1e3;
-var FIND_MS = seconds2("REVIEWPILOT_FIND_SECONDS", 240);
-var VERIFY_MS = seconds2("REVIEWPILOT_VERIFY_SECONDS", 180);
+var seconds = (name, fallback) => (Number(process.env[name]) || fallback) * 1e3;
+var FIND_MS = seconds("REVIEWPILOT_FIND_SECONDS", 240);
+var VERIFY_MS = seconds("REVIEWPILOT_VERIFY_SECONDS", 180);
 async function review(input2) {
   const { config, diffs, previous, log: log2 } = input2;
   const changed = input2.scope.filter((d) => d.status !== "deleted").map((d) => d.path);
@@ -17169,16 +16915,20 @@ async function review(input2) {
     dismissed.length && "Dismissed by the author (do not raise again):\n" + dismissed.map((p) => `- ${p.file}:${p.line} ${p.title}`).join("\n")
   ].filter(Boolean);
   const all = diffs.map((d) => `- ${d.path} (${d.status})`).join("\n");
-  const chunks = chunk(input2.scope, CHUNK_CHARS);
-  log2(`find: ${changed.length} of ${diffs.length} files in ${chunks.length} parts`);
+  const ui = input2.ui;
+  const chunks = findParts(input2.scope, ui?.paths);
+  const count2 = (lens) => chunks.filter((c) => c.lens === lens).length;
+  log2(`find: ${changed.length} of ${diffs.length} files in ${count2("code")} parts${ui ? `, plus ${count2("ui")} UI parts` : ""}`);
   const findStart = Date.now();
-  const parts = await pool(chunks, FIND_AGENTS, async (part, i) => {
+  const parts = await pool(chunks, FIND_AGENTS, async ({ files: part, lens }, i) => {
     const mine = part.filter((d) => d.status !== "deleted").map((d) => d.path);
     const user = [
       `PR title: ${input2.pr.title}`,
       `PR description:
 ${input2.pr.body.slice(0, 4e3) || "(none)"}`,
       ...history,
+      ...lens === "ui" && ui ? [ui.catalog ? `Design system catalog (default branch):
+${ui.catalog}` : "No shared components or tokens are configured; compare against how the rest of the app does it."] : [],
       `All files changed in the PR:
 ${all}`,
       `Your part (${i + 1} of ${chunks.length}). Diff, left column is the line number at the PR head; + added, - removed:
@@ -17194,22 +16944,23 @@ ${d.numbered}`;
     return runAgent({
       llm: input2.find,
       root: input2.root,
-      system: FIND_SYSTEM + repoSection(config, input2.rules, input2.guidance),
+      system: (lens === "ui" ? UI_SYSTEM : FIND_SYSTEM) + repoSection(config, input2.rules, input2.guidance),
       user,
-      submit: submitFindings(mine),
+      submit: submitFindings(mine, lens),
       maxTurns: 12,
       deadline: Date.now() + FIND_MS,
-      log: (line) => log2(`[part ${i + 1}] ${line}`)
+      log: (line) => log2(`[${lens === "ui" ? "ui " : ""}part ${i + 1}] ${line}`)
     }).catch((e) => {
-      log2(`[part ${i + 1}] find failed: ${e instanceof Error ? e.message : String(e)}`);
+      log2(`[${lens === "ui" ? "ui " : ""}part ${i + 1}] find failed: ${e instanceof Error ? e.message : String(e)}`);
       return void 0;
     });
   });
   const findMs = Date.now() - findStart;
-  const failedParts = parts.filter((p) => p === void 0).length;
-  const reviewed = chunks.flatMap((part, i) => {
+  const failed = { code: 0, ui: 0 };
+  chunks.forEach((c, i) => parts[i] === void 0 && (failed[c.lens] += 1));
+  const reviewed = chunks.flatMap(({ files, lens }, i) => {
     const p = parts[i];
-    return p ? part.filter((d) => p.checked.has(d.path)).map((d) => d.path) : [];
+    return p && lens === "code" ? files.filter((d) => p.checked.has(d.path)).map((d) => d.path) : [];
   });
   const ruleIds = new Set(input2.rules.map((r) => r.id));
   const candidates = parts.flatMap((p) => p?.findings ?? []);
@@ -17237,7 +16988,7 @@ ${d.numbered}`;
     const verdict = await runAgent({
       llm: input2.verify,
       root: input2.root,
-      system: VERIFY_SYSTEM,
+      system: VERIFY_SYSTEM + (finding.lens === "ui" ? VERIFY_UI : ""),
       user: [
         prev ? "This finding was reported on an earlier commit. Check whether it is still present at the current PR head (see the exception for earlier findings)." : "",
         reply ? `The PR author replied to it:
@@ -17264,7 +17015,7 @@ ${patchOf(finding.file)}`
     if (verdict) log2(`verify ${verdict.verdict}: ${finding.file}:${finding.line} ${finding.title} (${verdict.reason.slice(0, 160)})`);
     return { finding, ...verdict ? { verdict } : {}, ...prev ? { previous: prev } : {} };
   });
-  return { checked, candidates: found.length, verified: jobs.length, failedParts, parts: chunks.length, reviewed, findMs, verifyMs: Date.now() - verifyStart };
+  return { checked, candidates: found.length, verified: jobs.length, failed, parts: chunks.length, reviewed, findMs, verifyMs: Date.now() - verifyStart };
 }
 var Groups = type({ duplicates: "string[][]" });
 async function dedupe(llm, root, findings, known, log2) {
@@ -17320,6 +17071,380 @@ var settle = (finding, verdict) => ({
   body: verdict.body?.trim() || finding.body,
   evidence: verdict.evidence.length ? verdict.evidence : finding.evidence
 });
+
+// src/catalog.ts
+var BUDGET = { components: 9e3, tokens: 3e3, docs: 4e3 };
+var MAX_FILES = 400;
+var CODE = /\.(tsx?|jsx?|vue|svelte|css|scss)$/;
+var TEST = /(^|\/)__tests__\/|\.(test|spec|stories)\.\w+$/;
+function exportsOf(text) {
+  const names = [...text.matchAll(/^export\s+(?:default\s+)?(?:async\s+)?(?:function|const|let|class|type|interface|enum)\s+([A-Za-z_$][\w$]*)/gm)].map((m) => m[1] ?? "");
+  const lists = [...text.matchAll(/^export\s*(?:type\s*)?\{([^}]*)\}/gm)].flatMap(
+    (m) => (m[1] ?? "").split(",").map((part) => part.trim().replace(/^type\s+/, "").split(/\s+as\s+/).pop()?.trim() ?? "")
+  );
+  const vars = [...text.matchAll(/^\s*(--[\w-]+)\s*:/gm)].map((m) => m[1] ?? "");
+  return [...new Set([...names, ...lists, ...vars].filter((n) => n && n !== "default"))];
+}
+function fit(lines, budget) {
+  let used = 0;
+  const kept = lines.filter((l) => (used += l.length + 1) <= budget);
+  return kept.join("\n") + (kept.length < lines.length ? `
+(${lines.length - kept.length} more files not listed; search the repository for them)` : "");
+}
+async function section(root, ref, all, globs, budget) {
+  const files = all.filter((f) => CODE.test(f) && !TEST.test(f) && globs.some((g) => matchesGlob3(f, g))).slice(0, MAX_FILES);
+  const lines = await pool(files, 16, async (f) => {
+    const names = exportsOf(await readAt(root, ref, f) ?? "");
+    return names.length ? `- ${f}: ${names.join(", ")}` : "";
+  });
+  return fit(lines.filter(Boolean), budget);
+}
+async function uiCatalog(root, ref, ui) {
+  const all = await filesAt(root, ref);
+  const [components, tokens2, docs] = await Promise.all([
+    section(root, ref, all, ui.components, BUDGET.components),
+    section(root, ref, all, ui.tokens, BUDGET.tokens),
+    Promise.all(
+      all.filter((f) => ui.docs.some((g) => f === g || matchesGlob3(f, g))).map(async (f) => `--- ${f} ---
+${await readAt(root, ref, f) ?? ""}`)
+    ).then((parts) => parts.join("\n").slice(0, BUDGET.docs))
+  ]);
+  const catalog = [
+    components && `Shared components (path: exports):
+${components}`,
+    tokens2 && `Design tokens (path: exports):
+${tokens2}`,
+    docs && `UI docs:
+${docs}`
+  ].filter(Boolean).join("\n\n");
+  const empty = [
+    ui.components.length && !components ? "ui.components" : "",
+    ui.tokens.length && !tokens2 ? "ui.tokens" : "",
+    ui.docs.length && !docs ? "ui.docs" : ""
+  ].filter(Boolean);
+  return { catalog, empty };
+}
+
+// src/github.ts
+var User = type({ login: "string" });
+var Pr = type({
+  number: "number",
+  state: "'open' | 'closed'",
+  draft: "boolean",
+  title: "string",
+  body: "string | null",
+  user: User,
+  head: { sha: "string" },
+  base: { ref: "string", sha: "string", repo: { default_branch: "string" } }
+});
+var IssueComment = type({ id: "number", node_id: "string", body: "string", user: User.or("null") });
+var ReviewComment = type({
+  id: "number",
+  body: "string",
+  "in_reply_to_id?": "number",
+  /** The commit the comment was made on; unlike commit_id it does not move when the line goes stale. */
+  "original_commit_id?": "string",
+  user: User.or("null")
+});
+var Created = type({ id: "number" });
+var CheckRuns = type({ check_runs: type({ id: "number", started_at: "string | null" }).array() });
+var GraphQlEnvelope = type({ "errors?": type({ message: "string" }).array(), "data?": "unknown" });
+var ThreadsData = type({
+  data: {
+    repository: {
+      pullRequest: {
+        reviewThreads: {
+          nodes: type({
+            id: "string",
+            isResolved: "boolean",
+            resolvedBy: User.or("null"),
+            comments: {
+              nodes: type({
+                id: "string",
+                databaseId: "number | null",
+                body: "string",
+                authorAssociation: "string",
+                author: User.or("null")
+              }).array()
+            }
+          }).array()
+        }
+      }
+    }
+  }
+});
+var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function createGitHub(token, repo) {
+  const api = process.env.GITHUB_API_URL ?? "https://api.github.com";
+  async function call(schema2, method, path, body) {
+    const idempotent = method !== "POST" || path === "/graphql";
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(`${api}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: "application/vnd.github+json",
+          "X-GitHub-Api-Version": "2022-11-28",
+          "User-Agent": "reviewpilot",
+          ...body ? { "Content-Type": "application/json" } : {}
+        },
+        ...body ? { body: JSON.stringify(body) } : {},
+        signal: AbortSignal.timeout(3e4)
+      }).catch((e) => e instanceof Error ? e : new Error(String(e)));
+      const status = res instanceof Error ? 0 : res.status;
+      const after = res instanceof Error ? null : res.headers.get("retry-after");
+      const limited = status === 429 || status === 403 && after !== null;
+      const retryable = limited || idempotent && (status === 0 || status >= 500);
+      if (retryable && attempt < 3) {
+        const wait = after !== null ? Number(after) * 1e3 : NaN;
+        await sleep(Number.isFinite(wait) && wait > 0 ? Math.min(wait, 6e4) : 2 ** attempt * 1e3);
+        continue;
+      }
+      if (res instanceof Error) throw new Error(`GitHub ${method} ${path}: ${res.message}`);
+      if (!res.ok) throw new Error(`GitHub ${method} ${path}: ${res.status} ${(await res.text()).slice(0, 300)}`);
+      try {
+        return schema2.assert(res.status === 204 ? void 0 : await res.json());
+      } catch (e) {
+        throw new Error(`GitHub ${method} ${path}: unexpected response, ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+  }
+  async function all(schema2, path) {
+    const page = schema2.array();
+    const out = [];
+    for (let n = 1; n <= 30; n++) {
+      const batch = await call(page, "GET", `${path}${path.includes("?") ? "&" : "?"}per_page=100&page=${n}`);
+      out.push(...batch);
+      if (batch.length < 100) break;
+    }
+    return out;
+  }
+  async function graphql(schema2, query, variables) {
+    const res = await call(GraphQlEnvelope, "POST", "/graphql", { query, variables });
+    if (res.errors?.length) throw new Error(`GitHub GraphQL: ${res.errors.map((e) => e.message).join("; ")}`);
+    try {
+      return schema2.assert(res);
+    } catch (e) {
+      throw new Error(`GitHub GraphQL: unexpected response, ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  const [owner, name] = repo.split("/");
+  const r = `/repos/${repo}`;
+  const done = type("unknown");
+  return {
+    pr: (n) => call(Pr, "GET", `${r}/pulls/${n}`),
+    issueComments: (n) => all(IssueComment, `${r}/issues/${n}/comments`),
+    reviewComments: (n) => all(ReviewComment, `${r}/pulls/${n}/comments`),
+    comment: (n, body) => call(Created, "POST", `${r}/issues/${n}/comments`, { body }),
+    editComment: (id, body) => call(Created, "PATCH", `${r}/issues/comments/${id}`, { body }),
+    /** The ReviewPilot check on a commit. Needs Checks write on the token. */
+    createCheck: (head, body, name2 = "ReviewPilot") => call(Created, "POST", `${r}/check-runs`, { name: name2, head_sha: head, ...body }),
+    updateCheck: (id, body) => call(Created, "PATCH", `${r}/check-runs/${id}`, body),
+    /** ReviewPilot checks on a commit that are still in progress, with when they started. */
+    runningChecks: async (head) => (await call(CheckRuns, "GET", `${r}/commits/${head}/check-runs?check_name=ReviewPilot&status=in_progress&per_page=100`)).check_runs,
+    react: (commentId, content) => call(done, "POST", `${r}/issues/comments/${commentId}/reactions`, { content }),
+    reply: (n, commentId, body) => call(Created, "POST", `${r}/pulls/${n}/comments/${commentId}/replies`, { body }),
+    review: (n, commitId, comments) => call(Created, "POST", `${r}/pulls/${n}/reviews`, {
+      commit_id: commitId,
+      event: "COMMENT",
+      comments: comments.map((c) => ({
+        path: c.path,
+        line: c.line,
+        side: "RIGHT",
+        ...c.start_line ? { start_line: c.start_line, start_side: "RIGHT" } : {},
+        body: c.body
+      }))
+    }),
+    /** Removes an old summary; if deleting is not allowed, collapses it as outdated instead. */
+    async retire(comment) {
+      await call(done, "DELETE", `${r}/issues/comments/${comment.id}`).catch(
+        () => graphql(done, "mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized}}}", { id: comment.node_id })
+      );
+    },
+    async threads(n) {
+      const query = `query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){pullRequest(number:$n){
+        reviewThreads(first:100){nodes{id isResolved resolvedBy{login} comments(first:100){nodes{id databaseId body authorAssociation author{login}}}}}}}}`;
+      const res = await graphql(ThreadsData, query, { owner, name, n });
+      return res.data.repository.pullRequest.reviewThreads.nodes.map((t) => ({
+        id: t.id,
+        resolved: t.isResolved,
+        resolvedBy: t.resolvedBy?.login ?? "",
+        comments: t.comments.nodes.map((c) => ({
+          id: c.id,
+          databaseId: c.databaseId,
+          body: c.body,
+          author: c.author?.login ?? "",
+          association: c.authorAssociation
+        }))
+      }));
+    },
+    /**
+     * Closes a fixed finding: collapses its comment as outdated, then resolves the thread.
+     * GitHub only lets an App resolve threads with Contents write, which a reviewer should
+     * not need, so without it the thread stays open but collapsed. Returns whether it resolved.
+     */
+    async close(thread) {
+      const root = thread.comments[0];
+      if (root) {
+        await graphql(done, "mutation($id:ID!){minimizeComment(input:{subjectId:$id,classifier:OUTDATED}){minimizedComment{isMinimized}}}", { id: root.id });
+      }
+      return graphql(done, "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id}}}", { id: thread.id }).then(
+        () => true,
+        (e) => {
+          if (/not accessible by integration/i.test(String(e))) return false;
+          throw e;
+        }
+      );
+    }
+  };
+}
+
+// src/llm.ts
+var Completion = type({
+  "choices?": type({
+    "message?": {
+      "content?": "string | null",
+      "tool_calls?": type({ id: "string", type: "'function'", function: { name: "string", arguments: "string" } }).array()
+    }
+  }).array(),
+  // Providers differ here: some send null for the details, so they are optional and nullable.
+  "usage?": {
+    "prompt_tokens?": "number",
+    "completion_tokens?": "number",
+    "prompt_tokens_details?": type({ "cached_tokens?": "number | null" }).or("null")
+  },
+  "error?": { "message?": "string" }
+});
+var sleep2 = (ms) => new Promise((r) => setTimeout(r, ms));
+function createLlm(opts) {
+  const usage = { prompt: 0, completion: 0, calls: 0, cached: 0 };
+  const url2 = `${opts.baseUrl.replace(/\/$/, "")}/chat/completions`;
+  let sendEffort = opts.effort !== "none";
+  async function chat(messages, tools, force, deadline) {
+    const left = () => deadline === void 0 ? Infinity : deadline - Date.now();
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(url2, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${opts.apiKey}`,
+          "Content-Type": "application/json",
+          "User-Agent": "reviewpilot/0.1"
+        },
+        body: JSON.stringify({
+          model: opts.model,
+          messages,
+          tools,
+          tool_choice: force ? { type: "function", function: { name: force } } : "auto",
+          // "none" leaves the parameter out, for providers that reject it.
+          ...sendEffort ? { reasoning_effort: opts.effort } : {}
+        }),
+        // Never past the deadline for a normal turn (at least 60s), but the forced final call gets
+        // two minutes even past it: that answer is the part's whole result.
+        signal: AbortSignal.timeout(Math.max(force ? 12e4 : 6e4, Math.min(opts.timeoutMs ?? 24e4, left())))
+      }).catch((e) => ({ ok: false, status: 0, error: e }));
+      const retryable = !res.ok && (res.status === 0 || res.status === 429 || res.status >= 500);
+      if (retryable && attempt < 4 && left() > 15e3) {
+        const header = "headers" in res ? res.headers.get("retry-after") : null;
+        const wait = header ? Number(header) * 1e3 || Date.parse(header) - Date.now() : NaN;
+        await sleep2(Number.isFinite(wait) && wait > 0 ? Math.min(wait, 6e4) : 2 ** attempt * 3e3);
+        continue;
+      }
+      if (!res.ok) {
+        const detail = "text" in res ? await res.text().catch((e) => String(e)) : String(res.error);
+        if (res.status === 400 && sendEffort && /reasoning/i.test(detail) && attempt < 4) {
+          sendEffort = false;
+          continue;
+        }
+        throw new Error(`${opts.model}: HTTP ${res.status} ${detail.slice(0, 300)}`);
+      }
+      const text = await res.text().catch(() => void 0);
+      if (text === void 0 && attempt < 4 && left() > 15e3) {
+        await sleep2(2 ** attempt * 3e3);
+        continue;
+      }
+      if (text === void 0) throw new Error(`${opts.model}: the response body could not be read`);
+      let json3;
+      try {
+        json3 = JSON.parse(text);
+      } catch {
+        json3 = void 0;
+      }
+      const parsed2 = Completion(json3);
+      const data = parsed2 instanceof type.errors ? void 0 : parsed2;
+      if (!data && attempt < 4 && left() > 15e3) {
+        await sleep2(2 ** attempt * 3e3);
+        continue;
+      }
+      if (!data) throw new Error(`${opts.model}: response is not a chat completion: ${text.slice(0, 200)}`);
+      const message = data.choices?.[0]?.message;
+      if (!message && attempt < 4 && left() > 15e3) {
+        await sleep2(2 ** attempt * 3e3);
+        continue;
+      }
+      if (!message) throw new Error(`${opts.model}: empty response ${data.error?.message ?? ""}`);
+      usage.calls += 1;
+      usage.prompt += data.usage?.prompt_tokens ?? 0;
+      usage.completion += data.usage?.completion_tokens ?? 0;
+      usage.cached += data.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+      return {
+        role: "assistant",
+        content: message.content ?? null,
+        ...message.tool_calls?.length ? { tool_calls: message.tool_calls } : {}
+      };
+    }
+  }
+  return { model: opts.model, chat, usage };
+}
+
+// src/log.ts
+import { appendFile } from "node:fs/promises";
+var seconds2 = (ms) => ms >= 6e4 ? `${Math.floor(ms / 6e4)}m ${Math.floor(ms % 6e4 / 1e3)}s` : `${(ms / 1e3).toFixed(1)}s`;
+function createLog(actions) {
+  const phases = [];
+  const safe = (text) => actions ? text.replace(/^::/gm, ": :") : text;
+  const encode = (text) => text.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+  return {
+    phases,
+    line: (text) => console.log(safe(text)),
+    warn: (text) => console.log(actions ? `::warning::${encode(text)}` : `warning: ${text}`),
+    /** Runs one phase inside a log group and records how long it took. */
+    async phase(name, fn2) {
+      const start = performance.now();
+      console.log(actions ? `::group::${name}` : `> ${name}`);
+      try {
+        return await fn2();
+      } finally {
+        const ms = Math.round(performance.now() - start);
+        phases.push({ name, ms });
+        if (actions) console.log("::endgroup::");
+        console.log(`${name}: ${seconds2(ms)}`);
+      }
+    },
+    /** Appends the run report to the Actions job summary, when there is one. */
+    async report(facts) {
+      const file = process.env.GITHUB_STEP_SUMMARY;
+      if (!file) return;
+      const rows = phases.map((p) => `| ${p.name} | ${seconds2(p.ms)} |`).join("\n");
+      const total = phases.reduce((sum, p) => sum + p.ms, 0);
+      await appendFile(
+        file,
+        [
+          `### ReviewPilot run: ${facts.score}/5`,
+          "",
+          `${facts.findings.new} new, ${facts.findings.open} open, ${facts.findings.fixed} fixed. ${facts.verified} of ${facts.candidates} candidates verified.`,
+          "",
+          "| Phase | Time |",
+          "| --- | --- |",
+          rows,
+          `| **Total** | **${seconds2(total)}** |`,
+          "",
+          `Model \`${facts.model}\`: ${facts.usage.calls} calls, ${facts.usage.prompt.toLocaleString("en")} input (${facts.usage.cached.toLocaleString("en")} cached) and ${facts.usage.completion.toLocaleString("en")} output tokens.`,
+          ""
+        ].join("\n")
+      );
+    }
+  };
+}
 
 // src/index.ts
 var MAX_DIFF_CHARS = 4e5;
@@ -17390,15 +17515,23 @@ async function main() {
     if (id === void 0) return;
     await gh.updateCheck(id, { status: "completed", completed_at: (/* @__PURE__ */ new Date()).toISOString(), ...body }).then(() => void 0, (e) => log.warn(`Could not finish the ReviewPilot check: ${String(e).slice(0, 200)}`));
   };
+  let uiCheckDue = false;
+  const postUiCheck = async (body) => {
+    if (!uiCheckDue) return;
+    uiCheckDue = false;
+    const done = { status: "completed", completed_at: (/* @__PURE__ */ new Date()).toISOString() };
+    await gh.createCheck(pr.head.sha, { ...done, ...body }, "ReviewPilot UI").catch(() => body.output && gh.createCheck(pr.head.sha, { ...done, ...body, output: { ...body.output, annotations: [] } }, "ReviewPilot UI")).catch((e) => log.warn(`Could not post the ReviewPilot UI check: ${String(e).slice(0, 200)}`));
+  };
   let restoring;
   let stateSaved = false;
   const restoreSummary = (what) => restoring ??= putBackSummary(what);
   const putBackSummary = async (what) => {
     if (dryRun || summaryId === void 0 || stateSaved) return;
-    await finishCheck({
+    const ended = {
       conclusion: what === "stopped" ? "cancelled" : "neutral",
       output: { title: what === "stopped" ? "Stopped" : "Review failed", summary: what === "stopped" ? "A newer push or the time limit stopped this review." : "The review failed. Comment `/review` to retry." }
-    });
+    };
+    await Promise.all([finishCheck(ended), postUiCheck(ended)]);
     const runUrl = `${process.env.GITHUB_SERVER_URL ?? "https://github.com"}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}`;
     const restore = existing?.id === summaryId && !existing.body.startsWith(PROGRESS) ? existing.body : void 0;
     const why = what === "stopped" ? "A newer push or the time limit stopped it." : process.env.GITHUB_RUN_ID ? `See the [workflow run](${runUrl}).` : "See the ReviewPilot server logs.";
@@ -17426,10 +17559,11 @@ ${writeState(prev)}` : ""}`;
       return { mergeBase: mergeBase2, defaultRef: defaultRef2, ...loadConfig(await readAt(root, defaultRef2, ".reviewpilot.yml")) };
     });
     if (warning) log.warn(warning);
+    uiCheckDue = !dryRun && config.ui !== void 0;
     const model = input("model") ?? config.model.name;
     const verifyModel = input("verify_model") ?? config.model.verify;
     const baseUrl = input("base_url") ?? process.env.REVIEWPILOT_BASE_URL ?? "https://api.commandcode.ai/provider/v1";
-    const { diffs, skipped, guidance, threads, touched } = await log.phase("Diff and context", async () => {
+    const { diffs, skipped, guidance, threads, catalog, touched } = await log.phase("Diff and context", async () => {
       const all = parseDiff(await diff(root, mergeBase, pr.head.sha, config.review.ignore));
       const reviewable = all.filter((d) => !ignored(config, d.path) && d.commentable.size > 0);
       let size = 0;
@@ -17438,7 +17572,7 @@ ${writeState(prev)}` : ""}`;
         size += d.numbered.length;
         return true;
       });
-      const [guidance2, threads2] = await Promise.all([
+      const [guidance2, threads2, catalog2] = await Promise.all([
         Promise.all(config.context_files.map(async (f) => {
           const text = await readAt(root, defaultRef, f);
           return text ? `--- ${f} ---
@@ -17447,10 +17581,12 @@ ${text}` : "";
         gh.threads(number2).catch((e) => {
           log.warn(`Could not read review threads, so dismissals and closing are skipped this run: ${String(e)}`);
           return [];
-        })
+        }),
+        config.ui ? uiCatalog(root, defaultRef, config.ui) : { catalog: "", empty: [] }
       ]);
       log.line(`${diffs2.length} files, ${size.toLocaleString("en")} characters of diff, ${threads2.length} review threads`);
-      return { diffs: diffs2, skipped: reviewable.length - diffs2.length, guidance: guidance2, threads: threads2, touched: new Set(all.map((d) => d.path)) };
+      if (config.ui) log.line(`UI lens on, catalog ${catalog2.catalog.length.toLocaleString("en")} characters`);
+      return { diffs: diffs2, skipped: reviewable.length - diffs2.length, guidance: guidance2, threads: threads2, catalog: catalog2, touched: new Set(all.map((d) => d.path)) };
     });
     const threadOf = (f) => threads.find(
       (t) => f.commentId !== void 0 ? t.comments[0]?.databaseId === f.commentId : ours(t.comments[0]?.author) && lastMarker(t.comments[0]?.body ?? "", FINDING_TAG) === f.fp
@@ -17465,7 +17601,7 @@ ${text}` : "";
       }
       const t = threadOf(p);
       const resolved = t?.resolved && !ours(t.resolvedBy);
-      if (resolved || SEVERITIES.indexOf(p.severity) > minRank) {
+      if (resolved || SEVERITIES.indexOf(p.severity) > minRank || p.lens === "ui" && !config.ui) {
         p.status = "dismissed";
         continue;
       }
@@ -17483,7 +17619,7 @@ ${text}` : "";
     const { scope: scope2, fresh: freshLines, changed } = focus(diffs, seen, since);
     const limits = { diffs, scope: scope2, fresh: freshLines, incremental: seen !== void 0, outside: config.review.outside_diff };
     const followUp = !comment && prev !== void 0;
-    const { checked, candidates, verified, failedParts, parts, reviewed, findMs, verifyMs } = await log.phase(
+    const { checked, candidates, verified, failed, parts, reviewed, findMs, verifyMs } = await log.phase(
       "Review",
       () => review({
         find,
@@ -17499,6 +17635,7 @@ ${text}` : "";
         limits,
         followUp,
         changed,
+        ...config.ui ? { ui: { paths: config.ui.paths, catalog: catalog.catalog } } : {},
         replies,
         log: log.line
       })
@@ -17547,7 +17684,14 @@ ${text}` : "";
     });
     const open = findings.filter((f) => f.status === "open");
     const files = nextFiles(diffs, scope2, reviewed);
-    const state = { head: pr.head.sha, score: score(open), findings, files };
+    const state = {
+      head: pr.head.sha,
+      score: score(open.filter((f) => f.lens !== "ui")),
+      ...config.ui ? { uiScore: score(open.filter((f) => f.lens === "ui")) } : {},
+      findings,
+      files
+    };
+    const uiPass = config.ui?.pass_score;
     const comments = !dryRun && fresh.length ? await gh.reviewComments(number2).catch((e) => {
       log.warn(`Could not read review comments, so already posted findings may post again: ${String(e)}`);
       return [];
@@ -17573,7 +17717,8 @@ ${text}` : "";
       warning,
       skipped > 0 ? `${skipped} files did not fit in the review budget and were not reviewed.` : "",
       overCap > 0 ? `${overCap} more confirmed findings were over max_findings (${config.review.max_findings}) and are not shown.` : "",
-      failedParts > 0 ? `${failedParts} of ${parts} parts of the diff could not be reviewed this run, so this review is partial. Comment \`/review\` to retry.` : ""
+      failed.code + failed.ui > 0 ? `${failed.code + failed.ui} of ${parts} parts of the diff could not be reviewed this run, so this review is partial. Comment \`/review\` to retry.` : "",
+      catalog.empty.length ? `The UI lens found nothing usable for ${catalog.empty.join(", ")}: check the globs, and that token files are code or CSS with exports.` : ""
     ].filter(Boolean).join(" ");
     const modelLabel = verifyModel === model ? model : `${model} (verify: ${verifyModel})`;
     const usage = verify === find ? find.usage : {
@@ -17592,18 +17737,18 @@ ${text}` : "";
       candidates,
       verified,
       seconds: Math.round(elapsed / 1e3),
-      timing: `find ${seconds(findMs)}, verify ${seconds(verifyMs)}, rest ${seconds(Math.max(0, elapsed - findMs - verifyMs))}`,
+      timing: `find ${seconds2(findMs)}, verify ${seconds2(verifyMs)}, rest ${seconds2(Math.max(0, elapsed - findMs - verifyMs))}`,
       tokens: { prompt: usage.prompt, cached: usage.cached },
       ...warningText ? { warning: warningText } : {}
     };
-    log.line(`Score ${state.score}/5: ${fresh.length} new, ${open.length} open, ${fixedNow.length} fixed. ${usage.calls} model calls, ${usage.prompt.toLocaleString("en")} in (${usage.cached.toLocaleString("en")} cached) / ${usage.completion.toLocaleString("en")} out tokens.`);
+    log.line(`Score ${state.score}/5${state.uiScore ? `, UI ${state.uiScore}/5` : ""}: ${fresh.length} new, ${open.length} open, ${fixedNow.length} fixed. ${usage.calls} model calls, ${usage.prompt.toLocaleString("en")} in (${usage.cached.toLocaleString("en")} cached) / ${usage.completion.toLocaleString("en")} out tokens.`);
     if (dryRun) {
       for (const c of inline) log.line(`
 --- inline ${c.path}:${c.start_line ? `${c.start_line}-` : ""}${c.line}
 ${c.body}`);
       log.line(`
 --- summary
-${summaryBody(state, prev, outside, run2, config.review.pass_score)}`);
+${summaryBody(state, prev, outside, run2, config.review.pass_score, uiPass)}`);
       return;
     }
     if (stopping) return;
@@ -17624,7 +17769,7 @@ ${summaryBody(state, prev, outside, run2, config.review.pass_score)}`);
           outside.push(...fresh.filter((f) => !outside.includes(f) && !posted.has(f.fp)));
         }
       }
-      const body = summaryBody(state, prev, outside, run2, config.review.pass_score);
+      const body = summaryBody(state, prev, outside, run2, config.review.pass_score, uiPass);
       const saved = summaryId !== void 0 && await gh.editComment(summaryId, body).then(() => true, () => false);
       if (!saved) summaryId = (await gh.comment(number2, body)).id;
       stateSaved = true;
@@ -17645,11 +17790,15 @@ ${summaryBody(state, prev, outside, run2, config.review.pass_score)}`);
         if (!resolved) unresolved += 1;
       });
       if (unresolved) log.line(`${unresolved} fixed threads collapsed but left unresolved: resolving needs Contents write on the token.`);
-      const unsettled = checked.some((c) => !c.verdict && !(c.previous && replies.has(c.previous.fp)));
-      const partial = failedParts > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
-      const result = checkResult(state, run2, `https://github.com/${repo}/pull/${number2}#issuecomment-${summaryId}`, partial, config.review.pass_score);
+      const partial = (lens) => {
+        const unsettled = checked.some((c) => !c.verdict && lensOf(c.finding) === lens && !(c.previous && replies.has(c.previous.fp)));
+        return failed[lens] > 0 || unsettled ? "incomplete" : skipped > 0 ? "skipped" : false;
+      };
+      const summaryUrl = `https://github.com/${repo}/pull/${number2}#issuecomment-${summaryId}`;
+      const result = checkResult(lensView(state, "code"), run2, summaryUrl, partial("code"), config.review.pass_score);
       const finished = checkId !== void 0 && await gh.updateCheck(checkId, { status: "completed", completed_at: (/* @__PURE__ */ new Date()).toISOString(), ...result }).then(() => true, () => false);
       if (checkId !== void 0 && !finished && result.output) await finishCheck({ ...result, output: { ...result.output, annotations: [] } });
+      if (uiPass !== void 0) await postUiCheck(checkResult(lensView(state, "ui"), run2, summaryUrl, partial("ui"), uiPass));
     });
     await log.report({
       score: state.score,
@@ -17661,7 +17810,8 @@ ${summaryBody(state, prev, outside, run2, config.review.pass_score)}`);
     });
   } catch (e) {
     if (stateSaved) {
-      await finishCheck({ conclusion: "neutral", output: { title: "Posted, then a later step failed", summary: "The review and its summary are posted. A later step failed; see the logs." } });
+      const later = { conclusion: "neutral", output: { title: "Posted, then a later step failed", summary: "The review and its summary are posted. A later step failed; see the logs." } };
+      await Promise.all([finishCheck(later), postUiCheck(later)]);
     } else {
       await restoreSummary("failed");
     }

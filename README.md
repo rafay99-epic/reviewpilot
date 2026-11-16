@@ -157,7 +157,17 @@ rules:
     severity: critical
     paths: ["packages/backend/convex/schema.ts"]
     rule: A new field that stores user data needs a matching privacy policy update.
+
+# Optional: a second reviewer that checks UI code against your own design system.
+ui:
+  paths: ["apps/mobile/src/**/*.tsx"]          # files the UI lens reviews
+  components: ["apps/mobile/src/ui/**"]        # shared components; their exports form the catalog
+  tokens: ["apps/mobile/src/theme/**"]         # colors, spacing, type scale
+  docs: ["DESIGN.md", "docs/ui-consistency.md"] # UI rules, any markdown file name
+  pass_score: 5                                # the ReviewPilot UI check passes at this score
 ```
+
+With `ui` set, a UI lens reviews the files under `ui.paths` for consistency, not bugs: a new component that duplicates a shared one, raw primitives where a shared component exists, hard-coded values where a token exists, layouts that skip the structure sibling screens use. It reads a catalog of your components and tokens from the default branch, and every finding is verified like any other. UI findings are tagged UI, score separately (`UI 4/5` in the summary) and get their own **ReviewPilot UI** check, so a design nit and a bug gate apart.
 
 ## Inputs
 
